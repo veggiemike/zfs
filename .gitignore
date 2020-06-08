@@ -63,3 +63,5 @@ cscope.*
 *.orig
 *.log
 venv
+
+/FOO
