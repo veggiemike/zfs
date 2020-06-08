@@ -1,0 +1,19 @@
+Package: zfs
+Version: __version__
+Section: admin
+Priority: extra
+Source: zfs-linux
+Provides: zfs, zfs-dracut, zfs-initramfs, zfs-test, libnvpair1, libuutil1, libzfs2, libzfs2-devel, libzpool2, python3-pyzfs, zfs-zed, zfs-doc
+Conflicts: zfs-fuse, zfsutils-linux
+Breaks: zfs-dkms
+Homepage: http://www.zfsonlinux.org/
+Architecture: __arch__
+Installed-Size: __size__
+Depends: __deplibs__
+Maintainer: Michael D Labriola <michael.d.labriola@gmail.com>
+Description: userland portion of ZFS on Linux
+ The Z file system is a pooled filesystem designed for maximum data
+ integrity, supporting data snapshots, multiple copies, and data
+ checksums.
+ .
+ This package provides the entire userland installation for ZFS on Linux.
