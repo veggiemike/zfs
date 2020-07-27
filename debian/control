@@ -3,9 +3,9 @@ Version: __version__
 Section: admin
 Priority: extra
 Source: zfs-linux
-Provides: zfs, zfs-dracut, zfs-initramfs, zfs-test, libnvpair1, libuutil1, libzfs2, libzfs2-devel, libzpool2, python3-pyzfs, zfs-zed, zfs-doc
-Conflicts: zfs-fuse, zfsutils-linux
-Breaks: zfs-dkms
+Provides: zfs-dracut, zfs-initramfs, zfs-test, libnvpair1, libuutil1, libzfs2, libzfs2-devel, libzpool2, python3-pyzfs
+Conflicts: zfs-fuse
+Replaces: zfsutils-linux, zfs-zed, zfs-doc
 Homepage: http://www.zfsonlinux.org/
 Architecture: __arch__
 Installed-Size: __size__
