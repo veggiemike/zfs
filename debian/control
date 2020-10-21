@@ -3,7 +3,7 @@ Version: __version__
 Section: admin
 Priority: extra
 Source: zfs-linux
-Provides: zfs-dracut, zfs-initramfs, zfs-test, libnvpair1, libuutil1, libzfs2, libzfs2-devel, libzpool2, python3-pyzfs
+Provides: zfs-dracut, zfs-initramfs, zfs-test, libnvpair1, libuutil1, libzfs2, libzfs2-devel, libzpool2, python3-pyzfs, zfs-auto-snapshot
 Conflicts: zfs-fuse
 Replaces: zfsutils-linux, zfs-zed, zfs-doc
 Homepage: http://www.zfsonlinux.org/
@@ -17,3 +17,5 @@ Description: userland portion of ZFS on Linux
  checksums.
  .
  This package provides the entire userland installation for ZFS on Linux.
+ .
+ It also provides the zfs-auto-snapshot utility (w/out configuring cron).
