@@ -1,3 +1,6 @@
 [submodule "scripts/zfs-images"]
 	path = scripts/zfs-images
 	url = https://github.com/zfsonlinux/zfs-images
+[submodule "contrib/zfs-auto-snapshot"]
+	path = contrib/zfs-auto-snapshot
+	url = https://github.com/zfsonlinux/zfs-auto-snapshot.git
