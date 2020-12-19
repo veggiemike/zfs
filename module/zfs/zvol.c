@@ -466,8 +466,13 @@ out:
 	if (zv != NULL)
 		mutex_exit(&zv->zv_state_lock);
 
-	if (disk != NULL)
+	if (disk != NULL) {
+#ifdef HAVE_REVALIDATE_DISK_SIZE
+		revalidate_disk_size(disk, disk->fops->revalidate_disk(disk) == 0);
+#else
 		revalidate_disk(disk);
+#endif
+	}
 
 	return (SET_ERROR(error));
 }
