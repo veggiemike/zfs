@@ -26,6 +26,7 @@ rm -rf "$KERNEL_DIR/include/zfs" "$KERNEL_DIR/fs/zfs"
 cp -R include "$KERNEL_DIR/include/zfs"
 cp -R module "$KERNEL_DIR/fs/zfs"
 cp zfs_config.h "$KERNEL_DIR/include/zfs/"
+rm -f "$KERNEL_DIR/include/zfs/.gitignore"
 
 cat > "$KERNEL_DIR/fs/zfs/Kconfig" <<EOF
 config ZFS
