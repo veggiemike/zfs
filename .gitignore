@@ -88,3 +88,5 @@ changelog
 *.orig
 *.tmp
 *.log
+
+/FOO
