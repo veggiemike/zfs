@@ -1,0 +1,58 @@
+#!/bin/bash
+
+usage()
+{
+    echo "get a list of dependencies (based on libraries) for a deb control file from"
+    echo "a bunch of files/dirs recursively"
+    echo
+    echo "usage: $(basename $0) FILE1 [FILE2] ..."
+}
+
+
+if [ ! $# -ge 1 ]; then
+    usage
+    exit 1
+fi
+
+
+libs=$((find $* -type f | xargs ldd 2>/dev/null) | grep -v "not found" | awk '/=>/ {print $3}' | sort | uniq)
+echo
+echo libs: $libs
+
+if [ -z "$libs" ]; then
+    echo "no libs detected, nothing more to do, goodbye"
+    exit 0
+fi
+
+pkgs=
+missing=
+for l in $libs; do
+    # try the lib as reported by ldd
+    #echo trying $l
+    p=$(dpkg -S $l 2>/dev/null | awk -F: '{print $1}')
+    if [ -n "$p" ]; then
+        pkgs+=" $p"
+        continue
+    fi
+    # try canonicalized lib name
+    #echo trying $(realpath $l)
+    p=$(dpkg -S $(realpath $l) 2>/dev/null | awk -F: '{print $1}')
+    if [ -n "$p" ]; then
+        pkgs+=" $p"
+        continue
+    fi
+    # otherwise note that it's missing
+    missing+=" $l"
+    echo >>/dev/stderr "WARNING: no package found for $l"
+done
+pkgs2=$(echo $pkgs | sed 's| |\n|g' | sort | uniq)
+#echo $pkgs2
+echo
+echo pkgs: $(echo $pkgs2 | sed 's| |, |g')
+
+if [ -n "$missing" ]; then
+    echo >>/dev/stderr "Some libs weren't provided via dpkg, better fix that..."
+    exit 1
+fi
+
+exit 0
