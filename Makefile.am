@@ -259,7 +259,15 @@ $(DEBFILE): $(DEBCTRL)
 	rm -rf $(DPKGDIR)
 
 $(DPKGDIR):
-	$(MAKE) DESTDIR=$@ install
+	./configure --prefix=/usr --sbindir=/sbin --sysconfdir=/etc \
+	    --libdir=/usr/lib/x86_64-linux-gnu/ \
+	    --localstatedir=/var --with-systemdunitdir=/lib/systemd/system \
+	    --with-systemdpresetdir=/lib/systemd/system-preset \
+	    --with-systemdgeneratordir=/lib/systemd/system-generator \
+	    --enable-linux-builtin --enable-pyzfs
+	$(MAKE) clean
+	$(MAKE) all
+	$(MAKE) DESTDIR=$@ install-strip
 
 $(DEBDIR): $(DPKGDIR)
 	$(MKDIR_P) $@
