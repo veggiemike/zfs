@@ -1184,7 +1184,7 @@ ztest_kill(ztest_shared_t *zs)
 	 * See comment above spa_write_cachefile().
 	 */
 	mutex_enter(&spa_namespace_lock);
-	spa_write_cachefile(ztest_spa, B_FALSE, B_FALSE);
+	spa_write_cachefile(ztest_spa, B_FALSE, B_FALSE, B_FALSE);
 	mutex_exit(&spa_namespace_lock);
 
 	(void) kill(getpid(), SIGKILL);
@@ -2193,6 +2193,7 @@ ztest_replay_write(void *arg1, void *arg2, boolean_t byteswap)
 		 * but not always, because we also want to verify correct
 		 * behavior when the data was not recently read into cache.
 		 */
+		ASSERT(doi.doi_data_block_size);
 		ASSERT0(offset % doi.doi_data_block_size);
 		if (ztest_random(4) != 0) {
 			int prefetch = ztest_random(2) ?

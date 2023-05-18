@@ -150,6 +150,7 @@ typedef enum zfs_error {
 	EZFS_NO_RESILVER_DEFER,	/* pool doesn't support resilver_defer */
 	EZFS_EXPORT_IN_PROGRESS,	/* currently exporting the pool */
 	EZFS_REBUILDING,	/* resilvering (sequential reconstrution) */
+	EZFS_CKSUM,		/* insufficient replicas */
 	EZFS_UNKNOWN
 } zfs_error_t;
 
@@ -257,10 +258,10 @@ extern int zpool_add(zpool_handle_t *, nvlist_t *);
 
 typedef struct splitflags {
 	/* do not split, but return the config that would be split off */
-	int dryrun : 1;
+	unsigned int dryrun : 1;
 
 	/* after splitting, import the pool */
-	int import : 1;
+	unsigned int import : 1;
 	int name_flags;
 } splitflags_t;
 
@@ -306,6 +307,7 @@ extern int zpool_vdev_remove_cancel(zpool_handle_t *);
 extern int zpool_vdev_indirect_size(zpool_handle_t *, const char *, uint64_t *);
 extern int zpool_vdev_split(zpool_handle_t *, char *, nvlist_t **, nvlist_t *,
     splitflags_t);
+_LIBZFS_H int zpool_vdev_remove_wanted(zpool_handle_t *, const char *);
 
 extern int zpool_vdev_fault(zpool_handle_t *, uint64_t, vdev_aux_t);
 extern int zpool_vdev_degrade(zpool_handle_t *, uint64_t, vdev_aux_t);
@@ -649,13 +651,13 @@ extern int zfs_rollback(zfs_handle_t *, zfs_handle_t *, boolean_t);
 
 typedef struct renameflags {
 	/* recursive rename */
-	int recursive : 1;
+	unsigned int recursive : 1;
 
 	/* don't unmount file systems */
-	int nounmount : 1;
+	unsigned int nounmount : 1;
 
 	/* force unmount file systems */
-	int forceunmount : 1;
+	unsigned int forceunmount : 1;
 } renameflags_t;
 
 extern int zfs_rename(zfs_handle_t *, const char *, renameflags_t);
@@ -690,6 +692,9 @@ typedef struct sendflags {
 
 	/* show progress (ie. -v) */
 	boolean_t progress;
+
+	/* show progress as process title (ie. -V) */
+	boolean_t progressastitle;
 
 	/* large blocks (>128K) are permitted */
 	boolean_t largeblock;
@@ -795,9 +800,10 @@ extern int zfs_receive(libzfs_handle_t *, const char *, nvlist_t *,
     recvflags_t *, int, avl_tree_t *);
 
 typedef enum diff_flags {
-	ZFS_DIFF_PARSEABLE = 0x1,
-	ZFS_DIFF_TIMESTAMP = 0x2,
-	ZFS_DIFF_CLASSIFY = 0x4
+	ZFS_DIFF_PARSEABLE = 1 << 0,
+	ZFS_DIFF_TIMESTAMP = 1 << 1,
+	ZFS_DIFF_CLASSIFY = 1 << 2,
+	ZFS_DIFF_NO_MANGLE = 1 << 3
 } diff_flags_t;
 
 extern int zfs_show_diffs(zfs_handle_t *, int, const char *, const char *,

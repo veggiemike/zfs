@@ -53,6 +53,7 @@
 #include <cityhash.h>
 #include <sys/spa_impl.h>
 #include <sys/wmsum.h>
+#include <sys/vdev_impl.h>
 
 kstat_t *dbuf_ksp;
 
@@ -170,11 +171,6 @@ static void dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx);
 static void dbuf_sync_leaf_verify_bonus_dnode(dbuf_dirty_record_t *dr);
 static int dbuf_read_verify_dnode_crypt(dmu_buf_impl_t *db, uint32_t flags);
 
-extern inline void dmu_buf_init_user(dmu_buf_user_t *dbu,
-    dmu_buf_evict_func_t *evict_func_sync,
-    dmu_buf_evict_func_t *evict_func_async,
-    dmu_buf_t **clear_on_evict_dbufp);
-
 /*
  * Global data structures and functions for the dbuf cache.
  */
@@ -279,10 +275,10 @@ static unsigned long dbuf_metadata_cache_target_bytes(void);
 uint_t dbuf_cache_hiwater_pct = 10;
 uint_t dbuf_cache_lowater_pct = 10;
 
-/* ARGSUSED */
 static int
 dbuf_cons(void *vdb, void *unused, int kmflag)
 {
+	(void) unused, (void) kmflag;
 	dmu_buf_impl_t *db = vdb;
 	bzero(db, sizeof (dmu_buf_impl_t));
 
@@ -295,10 +291,10 @@ dbuf_cons(void *vdb, void *unused, int kmflag)
 	return (0);
 }
 
-/* ARGSUSED */
 static void
 dbuf_dest(void *vdb, void *unused)
 {
+	(void) unused;
 	dmu_buf_impl_t *db = vdb;
 	mutex_destroy(&db->db_mtx);
 	rw_destroy(&db->db_rwlock);
@@ -599,6 +595,68 @@ dbuf_is_metadata(dmu_buf_impl_t *db)
 	}
 }
 
+/*
+ * We want to exclude buffers that are on a special allocation class from
+ * L2ARC.
+ */
+boolean_t
+dbuf_is_l2cacheable(dmu_buf_impl_t *db)
+{
+	if (db->db_objset->os_secondary_cache == ZFS_CACHE_ALL ||
+	    (db->db_objset->os_secondary_cache ==
+	    ZFS_CACHE_METADATA && dbuf_is_metadata(db))) {
+		if (l2arc_exclude_special == 0)
+			return (B_TRUE);
+
+		blkptr_t *bp = db->db_blkptr;
+		if (bp == NULL || BP_IS_HOLE(bp))
+			return (B_FALSE);
+		uint64_t vdev = DVA_GET_VDEV(bp->blk_dva);
+		vdev_t *rvd = db->db_objset->os_spa->spa_root_vdev;
+		vdev_t *vd = NULL;
+
+		if (vdev < rvd->vdev_children)
+			vd = rvd->vdev_child[vdev];
+
+		if (vd == NULL)
+			return (B_TRUE);
+
+		if (vd->vdev_alloc_bias != VDEV_BIAS_SPECIAL &&
+		    vd->vdev_alloc_bias != VDEV_BIAS_DEDUP)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+static inline boolean_t
+dnode_level_is_l2cacheable(blkptr_t *bp, dnode_t *dn, int64_t level)
+{
+	if (dn->dn_objset->os_secondary_cache == ZFS_CACHE_ALL ||
+	    (dn->dn_objset->os_secondary_cache == ZFS_CACHE_METADATA &&
+	    (level > 0 ||
+	    DMU_OT_IS_METADATA(dn->dn_handle->dnh_dnode->dn_type)))) {
+		if (l2arc_exclude_special == 0)
+			return (B_TRUE);
+
+		if (bp == NULL || BP_IS_HOLE(bp))
+			return (B_FALSE);
+		uint64_t vdev = DVA_GET_VDEV(bp->blk_dva);
+		vdev_t *rvd = dn->dn_objset->os_spa->spa_root_vdev;
+		vdev_t *vd = NULL;
+
+		if (vdev < rvd->vdev_children)
+			vd = rvd->vdev_child[vdev];
+
+		if (vd == NULL)
+			return (B_TRUE);
+
+		if (vd->vdev_alloc_bias != VDEV_BIAS_SPECIAL &&
+		    vd->vdev_alloc_bias != VDEV_BIAS_DEDUP)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
 
 /*
  * This function *must* return indices evenly distributed between all
@@ -720,10 +778,10 @@ dbuf_evict_one(void)
  * of the dbuf cache is at or below the maximum size. Once the dbuf is aged
  * out of the cache it is destroyed and becomes eligible for arc eviction.
  */
-/* ARGSUSED */
 static void
 dbuf_evict_thread(void *unused)
 {
+	(void) unused;
 	callb_cpr_t cpr;
 
 	CALLB_CPR_INIT(&cpr, &dbuf_evict_lock, callb_generic_cpr, FTAG);
@@ -1276,6 +1334,7 @@ static void
 dbuf_read_done(zio_t *zio, const zbookmark_phys_t *zb, const blkptr_t *bp,
     arc_buf_t *buf, void *vdb)
 {
+	(void) zb, (void) bp;
 	dmu_buf_impl_t *db = vdb;
 
 	mutex_enter(&db->db_mtx);
@@ -1369,7 +1428,7 @@ dbuf_handle_indirect_hole(dmu_buf_impl_t *db, dnode_t *dn)
  * was taken, ENOENT if no action was taken.
  */
 static int
-dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
+dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn)
 {
 	ASSERT(MUTEX_HELD(&db->db_mtx));
 
@@ -1424,8 +1483,8 @@ dbuf_read_verify_dnode_crypt(dmu_buf_impl_t *db, uint32_t flags)
 
 	ASSERT(MUTEX_HELD(&db->db_mtx));
 
-	if (!os->os_encrypted || os->os_raw_receive ||
-	    (flags & DB_RF_NO_DECRYPT) != 0)
+	if ((flags & DB_RF_NO_DECRYPT) != 0 ||
+	    !os->os_encrypted || os->os_raw_receive)
 		return (0);
 
 	DB_DNODE_ENTER(db);
@@ -1469,10 +1528,8 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	zbookmark_phys_t zb;
 	uint32_t aflags = ARC_FLAG_NOWAIT;
 	int err, zio_flags;
-	boolean_t bonus_read;
 
 	err = zio_flags = 0;
-	bonus_read = B_FALSE;
 	DB_DNODE_ENTER(db);
 	dn = DB_DNODE(db);
 	ASSERT(!zfs_refcount_is_zero(&db->db_holds));
@@ -1487,7 +1544,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 		goto early_unlock;
 	}
 
-	err = dbuf_read_hole(db, dn, flags);
+	err = dbuf_read_hole(db, dn);
 	if (err == 0)
 		goto early_unlock;
 
@@ -1529,7 +1586,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	DTRACE_SET_STATE(db, "read issued");
 	mutex_exit(&db->db_mtx);
 
-	if (DBUF_IS_L2CACHEABLE(db))
+	if (dbuf_is_l2cacheable(db))
 		aflags |= ARC_FLAG_L2CACHE;
 
 	dbuf_add_ref(db, NULL);
@@ -1662,8 +1719,6 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 
 	mutex_enter(&db->db_mtx);
 	if (db->db_state == DB_CACHED) {
-		spa_t *spa = dn->dn_objset->os_spa;
-
 		/*
 		 * Ensure that this block's dnode has been decrypted if
 		 * the caller has requested decrypted data.
@@ -1682,6 +1737,7 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		    (arc_is_encrypted(db->db_buf) ||
 		    arc_is_unauthenticated(db->db_buf) ||
 		    arc_get_compression(db->db_buf) != ZIO_COMPRESS_OFF)) {
+			spa_t *spa = dn->dn_objset->os_spa;
 			zbookmark_phys_t zb;
 
 			SET_BOOKMARK(&zb, dmu_objset_id(db->db_objset),
@@ -1698,13 +1754,13 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		DB_DNODE_EXIT(db);
 		DBUF_STAT_BUMP(hash_hits);
 	} else if (db->db_state == DB_UNCACHED) {
-		spa_t *spa = dn->dn_objset->os_spa;
 		boolean_t need_wait = B_FALSE;
 
 		db_lock_type_t dblt = dmu_buf_lock_parent(db, RW_READER, FTAG);
 
 		if (zio == NULL &&
 		    db->db_blkptr != NULL && !BP_IS_HOLE(db->db_blkptr)) {
+			spa_t *spa = dn->dn_objset->os_spa;
 			zio = zio_root(spa, NULL, NULL, ZIO_FLAG_CANFAIL);
 			need_wait = B_TRUE;
 		}
@@ -2617,10 +2673,10 @@ dbuf_override_impl(dmu_buf_impl_t *db, const blkptr_t *bp, dmu_tx_t *tx)
 	dl->dr_overridden_by.blk_birth = dr->dr_txg;
 }
 
-/* ARGSUSED */
 void
 dmu_buf_fill_done(dmu_buf_t *dbuf, dmu_tx_t *tx)
 {
+	(void) tx;
 	dmu_buf_impl_t *db = (dmu_buf_impl_t *)dbuf;
 	dbuf_states_t old_state;
 	mutex_enter(&db->db_mtx);
@@ -2884,9 +2940,6 @@ dbuf_destroy(dmu_buf_impl_t *db)
 	ASSERT3U(db->db_caching_status, ==, DB_NO_CACHE);
 	ASSERT(!multilist_link_active(&db->db_cache_link));
 
-	kmem_cache_free(dbuf_kmem_cache, db);
-	arc_space_return(sizeof (dmu_buf_impl_t), ARC_SPACE_DBUF);
-
 	/*
 	 * If this dbuf is referenced from an indirect dbuf,
 	 * decrement the ref count on the indirect dbuf.
@@ -2895,6 +2948,9 @@ dbuf_destroy(dmu_buf_impl_t *db)
 		mutex_enter(&parent->db_mtx);
 		dbuf_rele_and_unlock(parent, db, B_TRUE);
 	}
+
+	kmem_cache_free(dbuf_kmem_cache, db);
+	arc_space_return(sizeof (dmu_buf_impl_t), ARC_SPACE_DBUF);
 }
 
 /*
@@ -3128,8 +3184,10 @@ typedef struct dbuf_prefetch_arg {
 static void
 dbuf_prefetch_fini(dbuf_prefetch_arg_t *dpa, boolean_t io_done)
 {
-	if (dpa->dpa_cb != NULL)
-		dpa->dpa_cb(dpa->dpa_arg, io_done);
+	if (dpa->dpa_cb != NULL) {
+		dpa->dpa_cb(dpa->dpa_arg, dpa->dpa_zb.zb_level,
+		    dpa->dpa_zb.zb_blkid, io_done);
+	}
 	kmem_free(dpa, sizeof (*dpa));
 }
 
@@ -3137,11 +3195,13 @@ static void
 dbuf_issue_final_prefetch_done(zio_t *zio, const zbookmark_phys_t *zb,
     const blkptr_t *iobp, arc_buf_t *abuf, void *private)
 {
+	(void) zio, (void) zb, (void) iobp;
 	dbuf_prefetch_arg_t *dpa = private;
 
-	dbuf_prefetch_fini(dpa, B_TRUE);
 	if (abuf != NULL)
 		arc_buf_destroy(abuf, private);
+
+	dbuf_prefetch_fini(dpa, B_TRUE);
 }
 
 /*
@@ -3185,6 +3245,7 @@ static void
 dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
     const blkptr_t *iobp, arc_buf_t *abuf, void *private)
 {
+	(void) zb, (void) iobp;
 	dbuf_prefetch_arg_t *dpa = private;
 
 	ASSERT3S(dpa->dpa_zb.zb_level, <, dpa->dpa_curlevel);
@@ -3238,10 +3299,10 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
 	blkptr_t *bp = ((blkptr_t *)abuf->b_data) +
 	    P2PHASE(nextblkid, 1ULL << dpa->dpa_epbs);
 
-	ASSERT(!BP_IS_REDACTED(bp) ||
+	ASSERT(!BP_IS_REDACTED(bp) || (dpa->dpa_dnode &&
 	    dsl_dataset_feature_is_active(
 	    dpa->dpa_dnode->dn_objset->os_dsl_dataset,
-	    SPA_FEATURE_REDACTED_DATASETS));
+	    SPA_FEATURE_REDACTED_DATASETS)));
 	if (BP_IS_HOLE(bp) || BP_IS_REDACTED(bp)) {
 		dbuf_prefetch_fini(dpa, B_TRUE);
 	} else if (dpa->dpa_curlevel == dpa->dpa_zb.zb_level) {
@@ -3261,7 +3322,8 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
 		    dpa->dpa_zb.zb_object, dpa->dpa_curlevel, nextblkid);
 
 		(void) arc_read(dpa->dpa_zio, dpa->dpa_spa,
-		    bp, dbuf_prefetch_indirect_done, dpa, dpa->dpa_prio,
+		    bp, dbuf_prefetch_indirect_done, dpa,
+		    ZIO_PRIORITY_SYNC_READ,
 		    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE,
 		    &iter_aflags, &zb);
 	}
@@ -3372,7 +3434,7 @@ dbuf_prefetch_impl(dnode_t *dn, int64_t level, uint64_t blkid,
 	dpa->dpa_arg = arg;
 
 	/* flag if L2ARC eligible, l2arc_noprefetch then decides */
-	if (DNODE_LEVEL_IS_L2CACHEABLE(dn, level))
+	if (dnode_level_is_l2cacheable(&bp, dn, level))
 		dpa->dpa_aflags |= ARC_FLAG_L2CACHE;
 
 	/*
@@ -3390,13 +3452,14 @@ dbuf_prefetch_impl(dnode_t *dn, int64_t level, uint64_t blkid,
 		zbookmark_phys_t zb;
 
 		/* flag if L2ARC eligible, l2arc_noprefetch then decides */
-		if (DNODE_LEVEL_IS_L2CACHEABLE(dn, level))
+		if (dnode_level_is_l2cacheable(&bp, dn, level))
 			iter_aflags |= ARC_FLAG_L2CACHE;
 
 		SET_BOOKMARK(&zb, ds != NULL ? ds->ds_object : DMU_META_OBJSET,
 		    dn->dn_object, curlevel, curblkid);
 		(void) arc_read(dpa->dpa_zio, dpa->dpa_spa,
-		    &bp, dbuf_prefetch_indirect_done, dpa, prio,
+		    &bp, dbuf_prefetch_indirect_done, dpa,
+		    ZIO_PRIORITY_SYNC_READ,
 		    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE,
 		    &iter_aflags, &zb);
 	}
@@ -3408,7 +3471,7 @@ dbuf_prefetch_impl(dnode_t *dn, int64_t level, uint64_t blkid,
 	return (1);
 no_issue:
 	if (cb != NULL)
-		cb(arg, B_FALSE);
+		cb(arg, level, blkid, B_FALSE);
 	return (0);
 }
 
@@ -3888,7 +3951,7 @@ dmu_buf_get_user(dmu_buf_t *db_fake)
 }
 
 void
-dmu_buf_user_evict_wait()
+dmu_buf_user_evict_wait(void)
 {
 	taskq_wait(dbu_evict_taskq);
 }
@@ -4451,10 +4514,10 @@ dbuf_sync_list(list_t *list, int level, dmu_tx_t *tx)
 	}
 }
 
-/* ARGSUSED */
 static void
 dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
+	(void) buf;
 	dmu_buf_impl_t *db = vdb;
 	dnode_t *dn;
 	blkptr_t *bp = zio->io_bp;
@@ -4542,7 +4605,6 @@ dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 	dmu_buf_unlock_parent(db, dblt, FTAG);
 }
 
-/* ARGSUSED */
 /*
  * This function gets called just prior to running through the compression
  * stage of the zio pipeline. If we're an indirect block comprised of only
@@ -4553,6 +4615,7 @@ dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 static void
 dbuf_write_children_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
+	(void) zio, (void) buf;
 	dmu_buf_impl_t *db = vdb;
 	dnode_t *dn;
 	blkptr_t *bp;
@@ -4596,10 +4659,10 @@ dbuf_write_children_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
  * so this callback allows us to retire dirty space gradually, as the physical
  * i/os complete.
  */
-/* ARGSUSED */
 static void
 dbuf_write_physdone(zio_t *zio, arc_buf_t *buf, void *arg)
 {
+	(void) buf;
 	dmu_buf_impl_t *db = arg;
 	objset_t *os = db->db_objset;
 	dsl_pool_t *dp = dmu_objset_pool(os);
@@ -4618,10 +4681,10 @@ dbuf_write_physdone(zio_t *zio, arc_buf_t *buf, void *arg)
 	dsl_pool_undirty_space(dp, delta, zio->io_txg);
 }
 
-/* ARGSUSED */
 static void
 dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
+	(void) buf;
 	dmu_buf_impl_t *db = vdb;
 	blkptr_t *bp_orig = &zio->io_bp_orig;
 	blkptr_t *bp = db->db_blkptr;
@@ -4988,7 +5051,7 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 			children_ready_cb = dbuf_write_children_ready;
 
 		dr->dr_zio = arc_write(pio, os->os_spa, txg,
-		    &dr->dr_bp_copy, data, DBUF_IS_L2CACHEABLE(db),
+		    &dr->dr_bp_copy, data, dbuf_is_l2cacheable(db),
 		    &zp, dbuf_write_ready,
 		    children_ready_cb, dbuf_write_physdone,
 		    dbuf_write_done, db, ZIO_PRIORITY_ASYNC_WRITE,

@@ -48,10 +48,10 @@
 /*
  * Metaslab granularity, in bytes. This is roughly similar to what would be
  * referred to as the "stripe size" in traditional RAID arrays. In normal
- * operation, we will try to write this amount of data to a top-level vdev
- * before moving on to the next one.
+ * operation, we will try to write this amount of data to each disk before
+ * moving on to the next top-level vdev.
  */
-unsigned long metaslab_aliquot = 512 << 10;
+static unsigned long metaslab_aliquot = 1024 * 1024;
 
 /*
  * For testing, make some blocks above a certain size be gang blocks.
@@ -899,7 +899,8 @@ metaslab_group_activate(metaslab_group_t *mg)
 	if (++mg->mg_activation_count <= 0)
 		return;
 
-	mg->mg_aliquot = metaslab_aliquot * MAX(1, mg->mg_vd->vdev_children);
+	mg->mg_aliquot = metaslab_aliquot * MAX(1,
+	    vdev_get_ndisks(mg->mg_vd) - vdev_get_nparity(mg->mg_vd));
 	metaslab_group_alloc_update(mg);
 
 	if ((mgprev = mc->mc_allocator[0].mca_rotor) == NULL) {
@@ -1406,7 +1407,6 @@ metaslab_size_tree_full_load(range_tree_t *rt)
  * Create any block allocator specific components. The current allocators
  * rely on using both a size-ordered range_tree_t and an array of uint64_t's.
  */
-/* ARGSUSED */
 static void
 metaslab_rt_create(range_tree_t *rt, void *arg)
 {
@@ -1431,10 +1431,10 @@ metaslab_rt_create(range_tree_t *rt, void *arg)
 	mrap->mra_floor_shift = metaslab_by_size_min_shift;
 }
 
-/* ARGSUSED */
 static void
 metaslab_rt_destroy(range_tree_t *rt, void *arg)
 {
+	(void) rt;
 	metaslab_rt_arg_t *mrap = arg;
 	zfs_btree_t *size_tree = mrap->mra_bt;
 
@@ -1442,7 +1442,6 @@ metaslab_rt_destroy(range_tree_t *rt, void *arg)
 	kmem_free(mrap, sizeof (*mrap));
 }
 
-/* ARGSUSED */
 static void
 metaslab_rt_add(range_tree_t *rt, range_seg_t *rs, void *arg)
 {
@@ -1456,7 +1455,6 @@ metaslab_rt_add(range_tree_t *rt, range_seg_t *rs, void *arg)
 	zfs_btree_add(size_tree, rs);
 }
 
-/* ARGSUSED */
 static void
 metaslab_rt_remove(range_tree_t *rt, range_seg_t *rs, void *arg)
 {
@@ -1470,7 +1468,6 @@ metaslab_rt_remove(range_tree_t *rt, range_seg_t *rs, void *arg)
 	zfs_btree_remove(size_tree, rs);
 }
 
-/* ARGSUSED */
 static void
 metaslab_rt_vacate(range_tree_t *rt, void *arg)
 {
@@ -2240,6 +2237,8 @@ metaslab_potentially_evict(metaslab_class_t *mc)
 			inuse = spl_kmem_cache_inuse(zfs_btree_leaf_cache);
 		}
 	}
+#else
+	(void) mc;
 #endif
 }
 
@@ -2661,7 +2660,8 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object,
 
 	/*
 	 * We only open space map objects that already exist. All others
-	 * will be opened when we finally allocate an object for it.
+	 * will be opened when we finally allocate an object for it. For
+	 * readonly pools there is no need to open the space map object.
 	 *
 	 * Note:
 	 * When called from vdev_expand(), we can't call into the DMU as
@@ -2670,7 +2670,8 @@ metaslab_init(metaslab_group_t *mg, uint64_t id, uint64_t object,
 	 * that case, the object parameter is zero though, so we won't
 	 * call into the DMU.
 	 */
-	if (object != 0) {
+	if (object != 0 && !(spa->spa_mode == SPA_MODE_READ &&
+	    !spa->spa_read_spacemaps)) {
 		error = space_map_open(&ms->ms_sm, mos, object, ms->ms_start,
 		    ms->ms_size, vd->vdev_ashift);
 
@@ -2756,7 +2757,8 @@ metaslab_fini_flush_data(metaslab_t *msp)
 	mutex_exit(&spa->spa_flushed_ms_lock);
 
 	spa_log_sm_decrement_mscount(spa, metaslab_unflushed_txg(msp));
-	spa_log_summary_decrement_mscount(spa, metaslab_unflushed_txg(msp));
+	spa_log_summary_decrement_mscount(spa, metaslab_unflushed_txg(msp),
+	    metaslab_unflushed_dirty(msp));
 }
 
 uint64_t
@@ -3734,6 +3736,61 @@ metaslab_condense(metaslab_t *msp, dmu_tx_t *tx)
 	metaslab_flush_update(msp, tx);
 }
 
+static void
+metaslab_unflushed_add(metaslab_t *msp, dmu_tx_t *tx)
+{
+	spa_t *spa = msp->ms_group->mg_vd->vdev_spa;
+	ASSERT(spa_syncing_log_sm(spa) != NULL);
+	ASSERT(msp->ms_sm != NULL);
+	ASSERT(range_tree_is_empty(msp->ms_unflushed_allocs));
+	ASSERT(range_tree_is_empty(msp->ms_unflushed_frees));
+
+	mutex_enter(&spa->spa_flushed_ms_lock);
+	metaslab_set_unflushed_txg(msp, spa_syncing_txg(spa), tx);
+	metaslab_set_unflushed_dirty(msp, B_TRUE);
+	avl_add(&spa->spa_metaslabs_by_flushed, msp);
+	mutex_exit(&spa->spa_flushed_ms_lock);
+
+	spa_log_sm_increment_current_mscount(spa);
+	spa_log_summary_add_flushed_metaslab(spa, B_TRUE);
+}
+
+void
+metaslab_unflushed_bump(metaslab_t *msp, dmu_tx_t *tx, boolean_t dirty)
+{
+	spa_t *spa = msp->ms_group->mg_vd->vdev_spa;
+	ASSERT(spa_syncing_log_sm(spa) != NULL);
+	ASSERT(msp->ms_sm != NULL);
+	ASSERT(metaslab_unflushed_txg(msp) != 0);
+	ASSERT3P(avl_find(&spa->spa_metaslabs_by_flushed, msp, NULL), ==, msp);
+	ASSERT(range_tree_is_empty(msp->ms_unflushed_allocs));
+	ASSERT(range_tree_is_empty(msp->ms_unflushed_frees));
+
+	VERIFY3U(tx->tx_txg, <=, spa_final_dirty_txg(spa));
+
+	/* update metaslab's position in our flushing tree */
+	uint64_t ms_prev_flushed_txg = metaslab_unflushed_txg(msp);
+	boolean_t ms_prev_flushed_dirty = metaslab_unflushed_dirty(msp);
+	mutex_enter(&spa->spa_flushed_ms_lock);
+	avl_remove(&spa->spa_metaslabs_by_flushed, msp);
+	metaslab_set_unflushed_txg(msp, spa_syncing_txg(spa), tx);
+	metaslab_set_unflushed_dirty(msp, dirty);
+	avl_add(&spa->spa_metaslabs_by_flushed, msp);
+	mutex_exit(&spa->spa_flushed_ms_lock);
+
+	/* update metaslab counts of spa_log_sm_t nodes */
+	spa_log_sm_decrement_mscount(spa, ms_prev_flushed_txg);
+	spa_log_sm_increment_current_mscount(spa);
+
+	/* update log space map summary */
+	spa_log_summary_decrement_mscount(spa, ms_prev_flushed_txg,
+	    ms_prev_flushed_dirty);
+	spa_log_summary_add_flushed_metaslab(spa, dirty);
+
+	/* cleanup obsolete logs if any */
+	spa_cleanup_old_sm_logs(spa, tx);
+}
+
 /*
  * Called when the metaslab has been flushed (its own spacemap now reflects
  * all the contents of the pool-wide spacemap log). Updates the metaslab's
@@ -3749,8 +3806,6 @@ metaslab_flush_update(metaslab_t *msp, dmu_tx_t *tx)
 	ASSERT(MUTEX_HELD(&msp->ms_lock));
 
 	ASSERT3U(spa_sync_pass(spa), ==, 1);
-	ASSERT(range_tree_is_empty(msp->ms_unflushed_allocs));
-	ASSERT(range_tree_is_empty(msp->ms_unflushed_frees));
 
 	/*
 	 * Just because a metaslab got flushed, that doesn't mean that
@@ -3763,39 +3818,11 @@ metaslab_flush_update(metaslab_t *msp, dmu_tx_t *tx)
 	 * We may end up here from metaslab_condense() without the
 	 * feature being active. In that case this is a no-op.
 	 */
-	if (!spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP))
+	if (!spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP) ||
+	    metaslab_unflushed_txg(msp) == 0)
 		return;
 
-	ASSERT(spa_syncing_log_sm(spa) != NULL);
-	ASSERT(msp->ms_sm != NULL);
-	ASSERT(metaslab_unflushed_txg(msp) != 0);
-	ASSERT3P(avl_find(&spa->spa_metaslabs_by_flushed, msp, NULL), ==, msp);
-
-	VERIFY3U(tx->tx_txg, <=, spa_final_dirty_txg(spa));
-
-	/* update metaslab's position in our flushing tree */
-	uint64_t ms_prev_flushed_txg = metaslab_unflushed_txg(msp);
-	mutex_enter(&spa->spa_flushed_ms_lock);
-	avl_remove(&spa->spa_metaslabs_by_flushed, msp);
-	metaslab_set_unflushed_txg(msp, spa_syncing_txg(spa), tx);
-	avl_add(&spa->spa_metaslabs_by_flushed, msp);
-	mutex_exit(&spa->spa_flushed_ms_lock);
-
-	/* update metaslab counts of spa_log_sm_t nodes */
-	spa_log_sm_decrement_mscount(spa, ms_prev_flushed_txg);
-	spa_log_sm_increment_current_mscount(spa);
-
-	/* cleanup obsolete logs if any */
-	uint64_t log_blocks_before = spa_log_sm_nblocks(spa);
-	spa_cleanup_old_sm_logs(spa, tx);
-	uint64_t log_blocks_after = spa_log_sm_nblocks(spa);
-	VERIFY3U(log_blocks_after, <=, log_blocks_before);
-
-	/* update log space map summary */
-	uint64_t blocks_gone = log_blocks_before - log_blocks_after;
-	spa_log_summary_add_flushed_metaslab(spa);
-	spa_log_summary_decrement_mscount(spa, ms_prev_flushed_txg);
-	spa_log_summary_decrement_blkcount(spa, blocks_gone);
+	metaslab_unflushed_bump(msp, tx, B_FALSE);
 }
 
 boolean_t
@@ -4011,23 +4038,6 @@ metaslab_sync(metaslab_t *msp, uint64_t txg)
 		ASSERT0(metaslab_allocated_space(msp));
 	}
 
-	if (metaslab_unflushed_txg(msp) == 0 &&
-	    spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP)) {
-		ASSERT(spa_syncing_log_sm(spa) != NULL);
-
-		metaslab_set_unflushed_txg(msp, spa_syncing_txg(spa), tx);
-		spa_log_sm_increment_current_mscount(spa);
-		spa_log_summary_add_flushed_metaslab(spa);
-
-		ASSERT(msp->ms_sm != NULL);
-		mutex_enter(&spa->spa_flushed_ms_lock);
-		avl_add(&spa->spa_metaslabs_by_flushed, msp);
-		mutex_exit(&spa->spa_flushed_ms_lock);
-
-		ASSERT(range_tree_is_empty(msp->ms_unflushed_allocs));
-		ASSERT(range_tree_is_empty(msp->ms_unflushed_frees));
-	}
-
 	if (!range_tree_is_empty(msp->ms_checkpointing) &&
 	    vd->vdev_checkpoint_sm == NULL) {
 		ASSERT(spa_has_checkpoint(spa));
@@ -4075,6 +4085,10 @@ metaslab_sync(metaslab_t *msp, uint64_t txg)
 	space_map_t *log_sm = spa_syncing_log_sm(spa);
 	if (log_sm != NULL) {
 		ASSERT(spa_feature_is_enabled(spa, SPA_FEATURE_LOG_SPACEMAP));
+		if (metaslab_unflushed_txg(msp) == 0)
+			metaslab_unflushed_add(msp, tx);
+		else if (!metaslab_unflushed_dirty(msp))
+			metaslab_unflushed_bump(msp, tx, B_TRUE);
 
 		space_map_write(log_sm, alloctree, SM_ALLOC,
 		    vd->vdev_id, tx);
@@ -4719,7 +4733,6 @@ metaslab_active_mask_verify(metaslab_t *msp)
 	}
 }
 
-/* ARGSUSED */
 static uint64_t
 metaslab_group_alloc_normal(metaslab_group_t *mg, zio_alloc_list_t *zal,
     uint64_t asize, uint64_t txg, boolean_t want_unique, dva_t *dva, int d,
@@ -5194,12 +5207,11 @@ top:
 		ASSERT(mg->mg_initialized);
 
 		/*
-		 * Avoid writing single-copy data to a failing,
+		 * Avoid writing single-copy data to an unhealthy,
 		 * non-redundant vdev, unless we've already tried all
 		 * other vdevs.
 		 */
-		if ((vd->vdev_stat.vs_write_errors > 0 ||
-		    vd->vdev_state < VDEV_STATE_HEALTHY) &&
+		if (vd->vdev_state < VDEV_STATE_HEALTHY &&
 		    d == 0 && !try_hard && vd->vdev_children == 0) {
 			metaslab_trace_add(zal, mg, NULL, psize, d,
 			    TRACE_VDEV_ERROR, allocator);
@@ -5345,11 +5357,11 @@ metaslab_free_concrete(vdev_t *vd, uint64_t offset, uint64_t asize,
 	mutex_exit(&msp->ms_lock);
 }
 
-/* ARGSUSED */
 void
 metaslab_free_impl_cb(uint64_t inner_offset, vdev_t *vd, uint64_t offset,
     uint64_t size, void *arg)
 {
+	(void) inner_offset;
 	boolean_t *checkpoint = arg;
 
 	ASSERT3P(checkpoint, !=, NULL);
@@ -5715,11 +5727,11 @@ typedef struct metaslab_claim_cb_arg_t {
 	int		mcca_error;
 } metaslab_claim_cb_arg_t;
 
-/* ARGSUSED */
 static void
 metaslab_claim_impl_cb(uint64_t inner_offset, vdev_t *vd, uint64_t offset,
     uint64_t size, void *arg)
 {
+	(void) inner_offset;
 	metaslab_claim_cb_arg_t *mcca_arg = arg;
 
 	if (mcca_arg->mcca_error == 0) {
@@ -5971,11 +5983,12 @@ metaslab_fastwrite_unmark(spa_t *spa, const blkptr_t *bp)
 	spa_config_exit(spa, SCL_VDEV, FTAG);
 }
 
-/* ARGSUSED */
 static void
 metaslab_check_free_impl_cb(uint64_t inner, vdev_t *vd, uint64_t offset,
     uint64_t size, void *arg)
 {
+	(void) inner, (void) arg;
+
 	if (vd->vdev_ops == &vdev_indirect_ops)
 		return;
 
@@ -6137,6 +6150,12 @@ metaslab_enable(metaslab_t *msp, boolean_t sync, boolean_t unload)
 	mutex_exit(&mg->mg_ms_disabled_lock);
 }
 
+void
+metaslab_set_unflushed_dirty(metaslab_t *ms, boolean_t dirty)
+{
+	ms->ms_unflushed_dirty = dirty;
+}
+
 static void
 metaslab_update_ondisk_flush_data(metaslab_t *ms, dmu_tx_t *tx)
 {
@@ -6173,13 +6192,14 @@ metaslab_update_ondisk_flush_data(metaslab_t *ms, dmu_tx_t *tx)
 void
 metaslab_set_unflushed_txg(metaslab_t *ms, uint64_t txg, dmu_tx_t *tx)
 {
-	spa_t *spa = ms->ms_group->mg_vd->vdev_spa;
-
-	if (!spa_feature_is_active(spa, SPA_FEATURE_LOG_SPACEMAP))
-		return;
-
 	ms->ms_unflushed_txg = txg;
 	metaslab_update_ondisk_flush_data(ms, tx);
+}
+
+boolean_t
+metaslab_unflushed_dirty(metaslab_t *ms)
+{
+	return (ms->ms_unflushed_dirty);
 }
 
 uint64_t

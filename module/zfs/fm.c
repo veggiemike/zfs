@@ -483,17 +483,17 @@ zfs_zevent_destroy(zfs_zevent_t *ze)
 /*
  * Wrappers for FM nvlist allocators
  */
-/* ARGSUSED */
 static void *
 i_fm_alloc(nv_alloc_t *nva, size_t size)
 {
+	(void) nva;
 	return (kmem_zalloc(size, KM_SLEEP));
 }
 
-/* ARGSUSED */
 static void
 i_fm_free(nv_alloc_t *nva, void *buf, size_t size)
 {
+	(void) nva;
 	kmem_free(buf, size);
 }
 
@@ -953,6 +953,7 @@ fm_fmri_hc_create(nvlist_t *fmri, int version, const nvlist_t *auth,
 			}
 			atomic_inc_64(
 			    &erpt_kstat_data.fmri_set_failed.value.ui64);
+			va_end(ap);
 			return;
 		}
 	}

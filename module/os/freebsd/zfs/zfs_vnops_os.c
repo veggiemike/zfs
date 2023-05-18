@@ -97,6 +97,10 @@
 
 VFS_SMR_DECLARE;
 
+#if __FreeBSD_version < 1300103
+#define	NDFREE_PNBUF(ndp)	NDFREE((ndp), NDF_ONLY_PNBUF)
+#endif
+
 #if __FreeBSD_version >= 1300047
 #define	vm_page_wire_lock(pp)
 #define	vm_page_wire_unlock(pp)
@@ -111,6 +115,12 @@ VFS_SMR_DECLARE;
 	    ("%s: wrong ref counts", __func__));
 #else
 #define	VNCHECKREF(vp)
+#endif
+
+#if __FreeBSD_version >= 1400045
+typedef uint64_t cookie_t;
+#else
+typedef ulong_t cookie_t;
 #endif
 
 /*
@@ -971,13 +981,17 @@ zfs_lookup(vnode_t *dvp, const char *nm, vnode_t **vpp,
 		case RENAME:
 			if (error == ENOENT) {
 				error = EJUSTRETURN;
+#if __FreeBSD_version < 1400068
 				cnp->cn_flags |= SAVENAME;
+#endif
 				break;
 			}
 			fallthrough;
 		case DELETE:
+#if __FreeBSD_version < 1400068
 			if (error == 0)
 				cnp->cn_flags |= SAVENAME;
+#endif
 			break;
 		}
 	}
@@ -1054,8 +1068,7 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
 	objset_t	*os;
 	dmu_tx_t	*tx;
 	int		error;
-	ksid_t		*ksid;
-	uid_t		uid;
+	uid_t		uid = crgetuid(cr);
 	gid_t		gid = crgetgid(cr);
 	uint64_t	projid = ZFS_DEFAULT_PROJID;
 	zfs_acl_ids_t   acl_ids;
@@ -1069,13 +1082,6 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
 	 * If we have an ephemeral id, ACL, or XVATTR then
 	 * make sure file system is at proper version
 	 */
-
-	ksid = crgetsid(cr, KSID_OWNER);
-	if (ksid)
-		uid = ksid_getid(ksid);
-	else
-		uid = crgetuid(cr);
-
 	if (zfsvfs->z_use_fuids == B_FALSE &&
 	    (vsecp || (vap->va_mask & AT_XVATTR) ||
 	    IS_EPHEMERAL(uid) || IS_EPHEMERAL(gid)))
@@ -1335,7 +1341,10 @@ zfs_lookup_internal(znode_t *dzp, const char *name, vnode_t **vpp,
 	cnp->cn_nameptr = __DECONST(char *, name);
 	cnp->cn_namelen = strlen(name);
 	cnp->cn_nameiop = nameiop;
-	cnp->cn_flags = ISLASTCN | SAVENAME;
+	cnp->cn_flags = ISLASTCN;
+#if __FreeBSD_version < 1400068
+	cnp->cn_flags |= SAVENAME;
+#endif
 	cnp->cn_lkflags = LK_EXCLUSIVE | LK_RETRY;
 	cnp->cn_cred = kcred;
 #if __FreeBSD_version < 1400037
@@ -1409,8 +1418,7 @@ zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap, znode_t **zpp,
 	uint64_t	txtype;
 	dmu_tx_t	*tx;
 	int		error;
-	ksid_t		*ksid;
-	uid_t		uid;
+	uid_t		uid = crgetuid(cr);
 	gid_t		gid = crgetgid(cr);
 	zfs_acl_ids_t   acl_ids;
 	boolean_t	fuid_dirtied;
@@ -1421,12 +1429,6 @@ zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap, znode_t **zpp,
 	 * If we have an ephemeral id, ACL, or XVATTR then
 	 * make sure file system is at proper version
 	 */
-
-	ksid = crgetsid(cr, KSID_OWNER);
-	if (ksid)
-		uid = ksid_getid(ksid);
-	else
-		uid = crgetuid(cr);
 	if (zfsvfs->z_use_fuids == B_FALSE &&
 	    ((vap->va_mask & AT_XVATTR) ||
 	    IS_EPHEMERAL(uid) || IS_EPHEMERAL(gid)))
@@ -1679,7 +1681,7 @@ zfs_rmdir(znode_t *dzp, const char *name, znode_t *cwd, cred_t *cr, int flags)
 /* ARGSUSED */
 static int
 zfs_readdir(vnode_t *vp, zfs_uio_t *uio, cred_t *cr, int *eofp,
-    int *ncookies, ulong_t **cookies)
+    int *ncookies, cookie_t **cookies)
 {
 	znode_t		*zp = VTOZ(vp);
 	iovec_t		*iovp;
@@ -1701,7 +1703,7 @@ zfs_readdir(vnode_t *vp, zfs_uio_t *uio, cred_t *cr, int *eofp,
 	boolean_t	check_sysattrs;
 	uint8_t		type;
 	int		ncooks;
-	ulong_t		*cooks = NULL;
+	cookie_t	*cooks = NULL;
 	int		flags = 0;
 
 	ZFS_ENTER(zfsvfs);
@@ -1778,7 +1780,7 @@ zfs_readdir(vnode_t *vp, zfs_uio_t *uio, cred_t *cr, int *eofp,
 		 */
 		ncooks = zfs_uio_resid(uio) / (sizeof (struct dirent) -
 		    sizeof (((struct dirent *)NULL)->d_name) + 1);
-		cooks = malloc(ncooks * sizeof (ulong_t), M_TEMP, M_WAITOK);
+		cooks = malloc(ncooks * sizeof (*cooks), M_TEMP, M_WAITOK);
 		*cookies = cooks;
 		*ncookies = ncooks;
 	}
@@ -2065,7 +2067,7 @@ zfs_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr)
 	vap->va_size = zp->z_size;
 	if (vp->v_type == VBLK || vp->v_type == VCHR)
 		vap->va_rdev = zfs_cmpldev(rdev);
-	vap->va_seq = zp->z_seq;
+	vap->va_gen = zp->z_gen;
 	vap->va_flags = 0;	/* FreeBSD: Reset chflags(2) flags. */
 	vap->va_filerev = zp->z_seq;
 
@@ -4067,8 +4069,8 @@ zfs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
 	int pgsin_b, pgsin_a;
 	int error;
 
-	ZFS_ENTER(zfsvfs);
-	ZFS_VERIFY_ZP(zp);
+	ZFS_ENTER_ERROR(zfsvfs, zfs_vm_pagerret_error);
+	ZFS_VERIFY_ZP_ERROR(zp, zfs_vm_pagerret_error);
 
 	start = IDX_TO_OFF(ma[0]->pindex);
 	end = IDX_TO_OFF(ma[count - 1]->pindex + 1);
@@ -4135,6 +4137,9 @@ zfs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
 	if (lr != NULL)
 		zfs_rangelock_exit(lr);
 	ZFS_ACCESSTIME_STAMP(zfsvfs, zp);
+
+	dataset_kstats_update_read_kstats(&zfsvfs->z_kstat, count*PAGE_SIZE);
+
 	ZFS_EXIT(zfsvfs);
 
 	if (error != 0)
@@ -4189,18 +4194,17 @@ zfs_putpages(struct vnode *vp, vm_page_t *ma, size_t len, int flags,
 	int		err;
 	int		i;
 
-	ZFS_ENTER(zfsvfs);
-	ZFS_VERIFY_ZP(zp);
-
 	object = vp->v_object;
-	pcount = btoc(len);
-	ncount = pcount;
-
 	KASSERT(ma[0]->object == object, ("mismatching object"));
 	KASSERT(len > 0 && (len & PAGE_MASK) == 0, ("unexpected length"));
 
+	pcount = btoc(len);
+	ncount = pcount;
 	for (i = 0; i < pcount; i++)
 		rtvals[i] = zfs_vm_pagerret_error;
+
+	ZFS_ENTER_ERROR(zfsvfs, zfs_vm_pagerret_error);
+	ZFS_VERIFY_ZP_ERROR(zp, zfs_vm_pagerret_error);
 
 	off = IDX_TO_OFF(ma[0]->pindex);
 	blksz = zp->z_blksz;
@@ -4312,6 +4316,9 @@ out:
 	if ((flags & (zfs_vm_pagerput_sync | zfs_vm_pagerput_inval)) != 0 ||
 	    zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS)
 		zil_commit(zfsvfs->z_log, zp->z_id);
+
+	dataset_kstats_update_write_kstats(&zfsvfs->z_kstat, len);
+
 	ZFS_EXIT(zfsvfs);
 	return (rtvals[0]);
 }
@@ -4642,7 +4649,9 @@ zfs_freebsd_create(struct vop_create_args *ap)
 	znode_t *zp = NULL;
 	int rc, mode;
 
+#if __FreeBSD_version < 1400068
 	ASSERT(cnp->cn_flags & SAVENAME);
+#endif
 
 	vattr_init_mask(vap);
 	mode = vap->va_mode & ALLPERMS;
@@ -4672,7 +4681,9 @@ static int
 zfs_freebsd_remove(struct vop_remove_args *ap)
 {
 
+#if __FreeBSD_version < 1400068
 	ASSERT(ap->a_cnp->cn_flags & SAVENAME);
+#endif
 
 	return (zfs_remove_(ap->a_dvp, ap->a_vp, ap->a_cnp->cn_nameptr,
 	    ap->a_cnp->cn_cred));
@@ -4694,7 +4705,9 @@ zfs_freebsd_mkdir(struct vop_mkdir_args *ap)
 	znode_t *zp = NULL;
 	int rc;
 
+#if __FreeBSD_version < 1400068
 	ASSERT(ap->a_cnp->cn_flags & SAVENAME);
+#endif
 
 	vattr_init_mask(vap);
 	*ap->a_vpp = NULL;
@@ -4720,7 +4733,9 @@ zfs_freebsd_rmdir(struct vop_rmdir_args *ap)
 {
 	struct componentname *cnp = ap->a_cnp;
 
+#if __FreeBSD_version < 1400068
 	ASSERT(cnp->cn_flags & SAVENAME);
+#endif
 
 	return (zfs_rmdir_(ap->a_dvp, ap->a_vp, cnp->cn_nameptr, cnp->cn_cred));
 }
@@ -4732,7 +4747,7 @@ struct vop_readdir_args {
 	struct ucred *a_cred;
 	int *a_eofflag;
 	int *a_ncookies;
-	ulong_t **a_cookies;
+	cookie_t **a_cookies;
 };
 #endif
 
@@ -4974,8 +4989,10 @@ zfs_freebsd_rename(struct vop_rename_args *ap)
 	vnode_t *tvp = ap->a_tvp;
 	int error;
 
+#if __FreeBSD_version < 1400068
 	ASSERT(ap->a_fcnp->cn_flags & (SAVENAME|SAVESTART));
 	ASSERT(ap->a_tcnp->cn_flags & (SAVENAME|SAVESTART));
+#endif
 
 	error = zfs_do_rename(fdvp, &fvp, ap->a_fcnp, tdvp, &tvp,
 	    ap->a_tcnp, ap->a_fcnp->cn_cred);
@@ -5011,7 +5028,9 @@ zfs_freebsd_symlink(struct vop_symlink_args *ap)
 #endif
 	int rc;
 
+#if __FreeBSD_version < 1400068
 	ASSERT(cnp->cn_flags & SAVENAME);
+#endif
 
 	vap->va_type = VLNK;	/* FreeBSD: Syscall only sets va_mode. */
 	vattr_init_mask(vap);
@@ -5105,7 +5124,9 @@ zfs_freebsd_link(struct vop_link_args *ap)
 	if (tdvp->v_mount != vp->v_mount)
 		return (EXDEV);
 
+#if __FreeBSD_version < 1400068
 	ASSERT(cnp->cn_flags & SAVENAME);
+#endif
 
 	return (zfs_link(VTOZ(tdvp), VTOZ(vp),
 	    cnp->cn_nameptr, cnp->cn_cred, 0));
@@ -5237,6 +5258,11 @@ zfs_freebsd_pathconf(struct vop_pathconf_args *ap)
 	case _PC_NAME_MAX:
 		*ap->a_retval = NAME_MAX;
 		return (0);
+#if __FreeBSD_version >= 1400032
+	case _PC_DEALLOC_PRESENT:
+		*ap->a_retval = 1;
+		return (0);
+#endif
 	case _PC_PIPE_BUF:
 		if (ap->a_vp->v_type == VDIR || ap->a_vp->v_type == VFIFO) {
 			*ap->a_retval = PIPE_BUF;
@@ -5359,10 +5385,10 @@ zfs_getextattr_dir(struct vop_getextattr_args *ap, const char *attrname)
 	NDINIT_ATVP(&nd, LOOKUP, NOFOLLOW, UIO_SYSSPACE, attrname, xvp);
 #endif
 	error = vn_open_cred(&nd, &flags, 0, VN_OPEN_INVFS, ap->a_cred, NULL);
-	vp = nd.ni_vp;
-	NDFREE(&nd, NDF_ONLY_PNBUF);
 	if (error != 0)
 		return (error);
+	vp = nd.ni_vp;
+	NDFREE_PNBUF(&nd);
 
 	if (ap->a_size != NULL) {
 		error = VOP_GETATTR(vp, &va, ap->a_cred);
@@ -5433,7 +5459,7 @@ zfs_getextattr(struct vop_getextattr_args *ap)
 
 	error = ENOENT;
 	ZFS_ENTER(zfsvfs);
-	ZFS_VERIFY_ZP(zp)
+	ZFS_VERIFY_ZP(zp);
 	rw_enter(&zp->z_xattr_lock, RW_READER);
 	if (zfsvfs->z_use_sa && zp->z_is_sa)
 		error = zfs_getextattr_sa(ap, attrname);
@@ -5476,14 +5502,12 @@ zfs_deleteextattr_dir(struct vop_deleteextattr_args *ap, const char *attrname)
 	    UIO_SYSSPACE, attrname, xvp);
 #endif
 	error = namei(&nd);
-	vp = nd.ni_vp;
-	if (error != 0) {
-		NDFREE(&nd, NDF_ONLY_PNBUF);
+	if (error != 0)
 		return (error);
-	}
 
+	vp = nd.ni_vp;
 	error = VOP_REMOVE(nd.ni_dvp, vp, &nd.ni_cnd);
-	NDFREE(&nd, NDF_ONLY_PNBUF);
+	NDFREE_PNBUF(&nd);
 
 	vput(nd.ni_dvp);
 	if (vp == nd.ni_dvp)
@@ -5607,10 +5631,10 @@ zfs_setextattr_dir(struct vop_setextattr_args *ap, const char *attrname)
 #endif
 	error = vn_open_cred(&nd, &flags, 0600, VN_OPEN_INVFS, ap->a_cred,
 	    NULL);
-	vp = nd.ni_vp;
-	NDFREE(&nd, NDF_ONLY_PNBUF);
 	if (error != 0)
 		return (error);
+	vp = nd.ni_vp;
+	NDFREE_PNBUF(&nd);
 
 	VATTR_NULL(&va);
 	va.va_size = 0;
@@ -5762,10 +5786,10 @@ zfs_listextattr_dir(struct vop_listextattr_args *ap, const char *attrprefix)
 	    UIO_SYSSPACE, ".", xvp);
 #endif
 	error = namei(&nd);
-	vp = nd.ni_vp;
-	NDFREE(&nd, NDF_ONLY_PNBUF);
 	if (error != 0)
 		return (error);
+	vp = nd.ni_vp;
+	NDFREE_PNBUF(&nd);
 
 	auio.uio_iov = &aiov;
 	auio.uio_iovcnt = 1;
@@ -6076,6 +6100,55 @@ zfs_vptocnp(struct vop_vptocnp_args *ap)
 	return (error);
 }
 
+#if __FreeBSD_version >= 1400032
+static int
+zfs_deallocate(struct vop_deallocate_args *ap)
+{
+	znode_t *zp = VTOZ(ap->a_vp);
+	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
+	zilog_t *zilog;
+	off_t off, len, file_sz;
+	int error;
+
+	ZFS_ENTER(zfsvfs);
+	ZFS_VERIFY_ZP(zp);
+
+	/*
+	 * Callers might not be able to detect properly that we are read-only,
+	 * so check it explicitly here.
+	 */
+	if (zfs_is_readonly(zfsvfs)) {
+		ZFS_EXIT(zfsvfs);
+		return (SET_ERROR(EROFS));
+	}
+
+	zilog = zfsvfs->z_log;
+	off = *ap->a_offset;
+	len = *ap->a_len;
+	file_sz = zp->z_size;
+	if (off + len > file_sz)
+		len = file_sz - off;
+	/* Fast path for out-of-range request. */
+	if (len <= 0) {
+		*ap->a_len = 0;
+		ZFS_EXIT(zfsvfs);
+		return (0);
+	}
+
+	error = zfs_freesp(zp, off, len, O_RDWR, TRUE);
+	if (error == 0) {
+		if (zfsvfs->z_os->os_sync == ZFS_SYNC_ALWAYS ||
+		    (ap->a_ioflag & IO_SYNC) != 0)
+			zil_commit(zilog, zp->z_id);
+		*ap->a_offset = off + len;
+		*ap->a_len = 0;
+	}
+
+	ZFS_EXIT(zfsvfs);
+	return (error);
+}
+#endif
+
 struct vop_vector zfs_vnodeops;
 struct vop_vector zfs_fifoops;
 struct vop_vector zfs_shareops;
@@ -6095,6 +6168,9 @@ struct vop_vector zfs_vnodeops = {
 #endif
 	.vop_access =		zfs_freebsd_access,
 	.vop_allocate =		VOP_EINVAL,
+#if __FreeBSD_version >= 1400032
+	.vop_deallocate =	zfs_deallocate,
+#endif
 	.vop_lookup =		zfs_cache_lookup,
 	.vop_cachedlookup =	zfs_freebsd_cachedlookup,
 	.vop_getattr =		zfs_freebsd_getattr,

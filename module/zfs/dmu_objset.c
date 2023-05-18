@@ -32,6 +32,7 @@
  * Copyright (c) 2018, loli10K <ezomori.nozomu@gmail.com>. All rights reserved.
  * Copyright (c) 2019, Klara Inc.
  * Copyright (c) 2019, Allan Jude
+ * Copyright (c) 2022 Hewlett Packard Enterprise Development LP.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -63,6 +64,8 @@
 #include <sys/dmu_recv.h>
 #include <sys/zfs_project.h>
 #include "zfs_namecheck.h"
+#include <sys/vdev_impl.h>
+#include <sys/arc.h>
 
 /*
  * Needed to close a window in dnode_move() that allows the objset to be freed
@@ -285,7 +288,9 @@ redundant_metadata_changed_cb(void *arg, uint64_t newval)
 	 * Inheritance and range checking should have been done by now.
 	 */
 	ASSERT(newval == ZFS_REDUNDANT_METADATA_ALL ||
-	    newval == ZFS_REDUNDANT_METADATA_MOST);
+	    newval == ZFS_REDUNDANT_METADATA_MOST ||
+	    newval == ZFS_REDUNDANT_METADATA_SOME ||
+	    newval == ZFS_REDUNDANT_METADATA_NONE);
 
 	os->os_redundant_metadata = newval;
 }
@@ -411,6 +416,34 @@ dnode_multilist_index_func(multilist_t *ml, void *obj)
 	    multilist_get_num_sublists(ml));
 }
 
+static inline boolean_t
+dmu_os_is_l2cacheable(objset_t *os)
+{
+	if (os->os_secondary_cache == ZFS_CACHE_ALL ||
+	    os->os_secondary_cache == ZFS_CACHE_METADATA) {
+		if (l2arc_exclude_special == 0)
+			return (B_TRUE);
+
+		blkptr_t *bp = os->os_rootbp;
+		if (bp == NULL || BP_IS_HOLE(bp))
+			return (B_FALSE);
+		uint64_t vdev = DVA_GET_VDEV(bp->blk_dva);
+		vdev_t *rvd = os->os_spa->spa_root_vdev;
+		vdev_t *vd = NULL;
+
+		if (vdev < rvd->vdev_children)
+			vd = rvd->vdev_child[vdev];
+
+		if (vd == NULL)
+			return (B_TRUE);
+
+		if (vd->vdev_alloc_bias != VDEV_BIAS_SPECIAL &&
+		    vd->vdev_alloc_bias != VDEV_BIAS_DEDUP)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
 /*
  * Instantiates the objset_t in-memory structure corresponding to the
  * objset_phys_t that's pointed to by the specified blkptr_t.
@@ -453,7 +486,7 @@ dmu_objset_open_impl(spa_t *spa, dsl_dataset_t *ds, blkptr_t *bp,
 		SET_BOOKMARK(&zb, ds ? ds->ds_object : DMU_META_OBJSET,
 		    ZB_ROOT_OBJECT, ZB_ROOT_LEVEL, ZB_ROOT_BLKID);
 
-		if (DMU_OS_IS_L2CACHEABLE(os))
+		if (dmu_os_is_l2cacheable(os))
 			aflags |= ARC_FLAG_L2CACHE;
 
 		if (ds != NULL && ds->ds_dir->dd_crypto_obj != 0) {
@@ -721,9 +754,9 @@ static int
 dmu_objset_own_impl(dsl_dataset_t *ds, dmu_objset_type_t type,
     boolean_t readonly, boolean_t decrypt, void *tag, objset_t **osp)
 {
-	int err;
+	(void) tag;
 
-	err = dmu_objset_from_ds(ds, osp);
+	int err = dmu_objset_from_ds(ds, osp);
 	if (err != 0) {
 		return (err);
 	} else if (type != DMU_OST_ANY && type != (*osp)->os_phys->os_type) {
@@ -1127,7 +1160,6 @@ typedef struct dmu_objset_create_arg {
 	dsl_crypto_params_t *doca_dcp;
 } dmu_objset_create_arg_t;
 
-/*ARGSUSED*/
 static int
 dmu_objset_create_check(void *arg, dmu_tx_t *tx)
 {
@@ -1269,6 +1301,7 @@ dmu_objset_create_sync(void *arg, dmu_tx_t *tx)
 			ASSERT3P(ds->ds_key_mapping, !=, NULL);
 			key_mapping_rele(spa, ds->ds_key_mapping, ds);
 			dsl_dataset_sync_done(ds, tx);
+			dmu_buf_rele(ds->ds_dbuf, ds);
 		}
 
 		mutex_enter(&ds->ds_lock);
@@ -1323,7 +1356,6 @@ typedef struct dmu_objset_clone_arg {
 	proc_t *doca_proc;
 } dmu_objset_clone_arg_t;
 
-/*ARGSUSED*/
 static int
 dmu_objset_clone_check(void *arg, dmu_tx_t *tx)
 {
@@ -1535,10 +1567,10 @@ dmu_objset_sync_dnodes(multilist_sublist_t *list, dmu_tx_t *tx)
 	}
 }
 
-/* ARGSUSED */
 static void
 dmu_objset_write_ready(zio_t *zio, arc_buf_t *abuf, void *arg)
 {
+	(void) abuf;
 	blkptr_t *bp = zio->io_bp;
 	objset_t *os = arg;
 	dnode_phys_t *dnp = &os->os_phys->os_meta_dnode;
@@ -1566,10 +1598,10 @@ dmu_objset_write_ready(zio_t *zio, arc_buf_t *abuf, void *arg)
 		rrw_exit(&os->os_dsl_dataset->ds_bp_rwlock, FTAG);
 }
 
-/* ARGSUSED */
 static void
 dmu_objset_write_done(zio_t *zio, arc_buf_t *abuf, void *arg)
 {
+	(void) abuf;
 	blkptr_t *bp = zio->io_bp;
 	blkptr_t *bp_orig = &zio->io_bp_orig;
 	objset_t *os = arg;
@@ -1663,7 +1695,7 @@ dmu_objset_sync(objset_t *os, zio_t *pio, dmu_tx_t *tx)
 	}
 
 	zio = arc_write(pio, os->os_spa, tx->tx_txg,
-	    blkptr_copy, os->os_phys_buf, DMU_OS_IS_L2CACHEABLE(os),
+	    blkptr_copy, os->os_phys_buf, dmu_os_is_l2cacheable(os),
 	    &zp, dmu_objset_write_ready, NULL, NULL, dmu_objset_write_done,
 	    os, ZIO_PRIORITY_ASYNC_WRITE, ZIO_FLAG_MUSTSUCCEED, &zb);
 

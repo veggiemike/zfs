@@ -95,9 +95,11 @@ vn_flush_cached_data(vnode_t *vp, boolean_t sync)
 	if (vp->v_object->flags & OBJ_MIGHTBEDIRTY) {
 #endif
 		int flags = sync ? OBJPC_SYNC : 0;
+		vn_lock(vp, LK_SHARED | LK_RETRY);
 		zfs_vmobject_wlock(vp->v_object);
 		vm_object_page_clean(vp->v_object, 0, 0, flags);
 		zfs_vmobject_wunlock(vp->v_object);
+		VOP_UNLOCK(vp);
 	}
 }
 
@@ -132,7 +134,6 @@ vn_flush_cached_data(vnode_t *vp, boolean_t sync)
 /* TODO: This field needs conversion! */
 #define	va_nblocks	va_bytes
 #define	va_blksize	va_blocksize
-#define	va_seq		va_gen
 
 #define	MAXOFFSET_T	OFF_MAX
 #define	EXCL		0

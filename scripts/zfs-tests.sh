@@ -38,6 +38,7 @@ VERBOSE="no"
 QUIET=""
 CLEANUP="yes"
 CLEANUPALL="no"
+KMSG=""
 LOOPBACK="yes"
 STACK_TRACER="no"
 FILESIZE="4G"
@@ -53,6 +54,7 @@ ZFS_DBGMSG="$STF_SUITE/callbacks/zfs_dbgmsg.ksh"
 ZFS_DMESG="$STF_SUITE/callbacks/zfs_dmesg.ksh"
 UNAME=$(uname -s)
 RERUN=""
+KMEMLEAK=""
 
 # Override some defaults if on FreeBSD
 if [ "$UNAME" = "FreeBSD" ] ; then
@@ -95,7 +97,7 @@ cleanup_freebsd_loopback() {
 
 cleanup_linux_loopback() {
 	for TEST_LOOPBACK in ${LOOPBACKS}; do
-		LOOP_DEV=$(basename "$TEST_LOOPBACK")
+		LOOP_DEV="${TEST_LOOPBACK##*/}"
 		DM_DEV=$(sudo "${DMSETUP}" ls 2>/dev/null | \
 		    grep "${LOOP_DEV}" | cut -f1)
 
@@ -324,10 +326,12 @@ OPTIONS:
 	-q          Quiet test-runner output
 	-x          Remove all testpools, dm, lo, and files (unsafe)
 	-k          Disable cleanup after test failure
+	-K          Log test names to /dev/kmsg
 	-f          Use files only, disables block device tests
 	-S          Enable stack tracer (negative performance impact)
 	-c          Only create and populate constrained path
 	-R          Automatically rerun failing tests
+	-m          Enable kmemleak reporting (Linux only)
 	-n NFSFILE  Use the nfsfile to determine the NFS configuration
 	-I NUM      Number of iterations
 	-d DIR      Use DIR for files and loopback devices
@@ -354,7 +358,7 @@ $0 -x
 EOF
 }
 
-while getopts 'hvqxkfScRn:d:s:r:?t:T:u:I:' OPTION; do
+while getopts 'hvqxkKfScRmn:d:s:r:?t:T:u:I:' OPTION; do
 	case $OPTION in
 	h)
 		usage
@@ -372,6 +376,9 @@ while getopts 'hvqxkfScRn:d:s:r:?t:T:u:I:' OPTION; do
 	k)
 		CLEANUP="no"
 		;;
+	K)
+		KMSG="yes"
+		;;
 	f)
 		LOOPBACK="no"
 		;;
@@ -384,6 +391,9 @@ while getopts 'hvqxkfScRn:d:s:r:?t:T:u:I:' OPTION; do
 		;;
 	R)
 		RERUN="yes"
+		;;
+	m)
+		KMEMLEAK="yes"
 		;;
 	n)
 		nfsfile=$OPTARG
@@ -615,7 +625,7 @@ if [ -z "${DISKS}" ]; then
 				TEST_LOOPBACK=$(sudo "${LOSETUP}" -f)
 				sudo "${LOSETUP}" "${TEST_LOOPBACK}" "${TEST_FILE}" ||
 				    fail "Failed: ${TEST_FILE} -> ${TEST_LOOPBACK}"
-				BASELOOPBACK=$(basename "$TEST_LOOPBACK")
+				BASELOOPBACK="${TEST_LOOPBACK##*/}"
 				DISKS="$DISKS $BASELOOPBACK"
 				LOOPBACKS="$LOOPBACKS $TEST_LOOPBACK"
 			fi
@@ -680,24 +690,30 @@ export __ZFS_POOL_EXCLUDE
 export TESTFAIL_CALLBACKS
 export PATH=$STF_PATH
 
-if [ "$UNAME" = "FreeBSD" ] ; then
-	mkdir -p "$FILEDIR" || true
-	RESULTS_FILE=$(mktemp -u "${FILEDIR}/zts-results.XXXXXX")
-	REPORT_FILE=$(mktemp -u "${FILEDIR}/zts-report.XXXXXX")
-else
-	RESULTS_FILE=$(mktemp -u -t zts-results.XXXXXX -p "$FILEDIR")
-	REPORT_FILE=$(mktemp -u -t zts-report.XXXXXX -p "$FILEDIR")
-fi
+mktemp_file() {
+	if [ "$UNAME" = "FreeBSD" ]; then
+		mktemp -u "${FILEDIR}/$1.XXXXXX"
+	else
+		mktemp -ut "$1.XXXXXX" -p "$FILEDIR"
+	fi
+}
+mkdir -p "$FILEDIR" || :
+RESULTS_FILE=$(mktemp_file zts-results)
+REPORT_FILE=$(mktemp_file zts-report)
 
 #
 # Run all the tests as specified.
 #
-msg "${TEST_RUNNER} ${QUIET:+-q}" \
+msg "${TEST_RUNNER}" \
+    "${QUIET:+-q}" \
+    "${KMEMLEAK:+-m}" \
+    "${KMSG:+-K}" \
     "-c \"${RUNFILES}\"" \
     "-T \"${TAGS}\"" \
     "-i \"${STF_SUITE}\"" \
     "-I \"${ITERATIONS}\""
-${TEST_RUNNER} ${QUIET:+-q} \
+${TEST_RUNNER} ${QUIET:+-q} ${KMEMLEAK:+-m} \
+    ${KMSG:+-K} \
     -c "${RUNFILES}" \
     -T "${TAGS}" \
     -i "${STF_SUITE}" \
@@ -711,13 +727,13 @@ RESULT=$?
 
 if [ "$RESULT" -eq "2" ] && [ -n "$RERUN" ]; then
 	MAYBES="$($ZTS_REPORT --list-maybes)"
-	TEMP_RESULTS_FILE=$(mktemp -u -t zts-results-tmp.XXXXX -p "$FILEDIR")
-	TEST_LIST=$(mktemp -u -t test-list.XXXXX -p "$FILEDIR")
+	TEMP_RESULTS_FILE=$(mktemp_file zts-results-tmp)
+	TEST_LIST=$(mktemp_file test-list)
 	grep "^Test:.*\[FAIL\]" "$RESULTS_FILE" >"$TEMP_RESULTS_FILE"
 	for test_name in $MAYBES; do
 		grep "$test_name " "$TEMP_RESULTS_FILE" >>"$TEST_LIST"
 	done
-	${TEST_RUNNER} ${QUIET:+-q} \
+	${TEST_RUNNER} ${QUIET:+-q} ${KMEMLEAK:+-m} \
 	    -c "${RUNFILES}" \
 	    -T "${TAGS}" \
 	    -i "${STF_SUITE}" \

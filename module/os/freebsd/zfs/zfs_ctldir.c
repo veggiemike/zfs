@@ -496,7 +496,7 @@ zfsctl_common_getattr(vnode_t *vp, vattr_t *vap)
 	 */
 	vap->va_blksize = 0;
 	vap->va_nblocks = 0;
-	vap->va_seq = 0;
+	vap->va_gen = 0;
 	vn_fsid(vp, vap);
 	vap->va_mode = zfsctl_ctldir_mode;
 	vap->va_type = VDIR;
@@ -976,12 +976,13 @@ zfsctl_snapdir_lookup(struct vop_lookup_args *ap)
 		 */
 		VI_LOCK(*vpp);
 		if (((*vpp)->v_iflag & VI_MOUNT) == 0) {
+			VI_UNLOCK(*vpp);
 			/*
 			 * Upgrade to exclusive lock in order to:
 			 * - avoid race conditions
 			 * - satisfy the contract of mount_snapshot()
 			 */
-			err = VOP_LOCK(*vpp, LK_TRYUPGRADE | LK_INTERLOCK);
+			err = VOP_LOCK(*vpp, LK_TRYUPGRADE);
 			if (err == 0)
 				break;
 		} else {

@@ -545,10 +545,10 @@ vdev_raidz_generate_parity(raidz_map_t *rm)
 	}
 }
 
-/* ARGSUSED */
 static int
 vdev_raidz_reconst_p_func(void *dbuf, void *sbuf, size_t size, void *private)
 {
+	(void) private;
 	uint64_t *dst = dbuf;
 	uint64_t *src = sbuf;
 	int cnt = size / sizeof (src[0]);
@@ -560,11 +560,11 @@ vdev_raidz_reconst_p_func(void *dbuf, void *sbuf, size_t size, void *private)
 	return (0);
 }
 
-/* ARGSUSED */
 static int
 vdev_raidz_reconst_q_pre_func(void *dbuf, void *sbuf, size_t size,
     void *private)
 {
+	(void) private;
 	uint64_t *dst = dbuf;
 	uint64_t *src = sbuf;
 	uint64_t mask;
@@ -578,10 +578,10 @@ vdev_raidz_reconst_q_pre_func(void *dbuf, void *sbuf, size_t size,
 	return (0);
 }
 
-/* ARGSUSED */
 static int
 vdev_raidz_reconst_q_pre_tail_func(void *buf, size_t size, void *private)
 {
+	(void) private;
 	uint64_t *dst = buf;
 	uint64_t mask;
 	int cnt = size / sizeof (dst[0]);
@@ -1426,8 +1426,14 @@ vdev_raidz_open(vdev_t *vd, uint64_t *asize, uint64_t *max_asize,
 		*asize = MIN(*asize - 1, cvd->vdev_asize - 1) + 1;
 		*max_asize = MIN(*max_asize - 1, cvd->vdev_max_asize - 1) + 1;
 		*logical_ashift = MAX(*logical_ashift, cvd->vdev_ashift);
-		*physical_ashift = MAX(*physical_ashift,
-		    cvd->vdev_physical_ashift);
+	}
+	for (c = 0; c < vd->vdev_children; c++) {
+		vdev_t *cvd = vd->vdev_child[c];
+
+		if (cvd->vdev_open_error != 0)
+			continue;
+		*physical_ashift = vdev_best_ashift(*logical_ashift,
+		    *physical_ashift, cvd->vdev_physical_ashift);
 	}
 
 	*asize *= vd->vdev_children;
@@ -1654,8 +1660,8 @@ vdev_raidz_io_start(zio_t *zio)
 /*
  * Report a checksum error for a child of a RAID-Z device.
  */
-static void
-raidz_checksum_error(zio_t *zio, raidz_col_t *rc, abd_t *bad_data)
+void
+vdev_raidz_checksum_error(zio_t *zio, raidz_col_t *rc, abd_t *bad_data)
 {
 	vdev_t *vd = zio->io_vd->vdev_child[rc->rc_devidx];
 
@@ -1721,9 +1727,17 @@ raidz_parity_verify(zio_t *zio, raidz_row_t *rr)
 		if (!rc->rc_tried || rc->rc_error != 0)
 			continue;
 
-		orig[c] = abd_alloc_sametype(rc->rc_abd, rc->rc_size);
-		abd_copy(orig[c], rc->rc_abd, rc->rc_size);
+		orig[c] = rc->rc_abd;
+		ASSERT3U(abd_get_size(rc->rc_abd), ==, rc->rc_size);
+		rc->rc_abd = abd_alloc_linear(rc->rc_size, B_FALSE);
 	}
+
+	/*
+	 * Verify any empty sectors are zero filled to ensure the parity
+	 * is calculated correctly even if these non-data sectors are damaged.
+	 */
+	if (rr->rr_nempty && rr->rr_abd_empty != NULL)
+		ret += vdev_draid_map_verify_empty(zio, rr);
 
 	/*
 	 * Regenerates parity even for !tried||rc_error!=0 columns.  This
@@ -1739,7 +1753,7 @@ raidz_parity_verify(zio_t *zio, raidz_row_t *rr)
 			continue;
 
 		if (abd_cmp(orig[c], rc->rc_abd) != 0) {
-			raidz_checksum_error(zio, rc, orig[c]);
+			vdev_raidz_checksum_error(zio, rc, orig[c]);
 			rc->rc_error = SET_ERROR(ECKSUM);
 			ret++;
 		}
@@ -1784,6 +1798,9 @@ vdev_raidz_io_done_verified(zio_t *zio, raidz_row_t *rr)
 		} else if (c < rr->rr_firstdatacol && !rc->rc_tried) {
 			parity_untried++;
 		}
+
+		if (rc->rc_force_repair)
+			unexpected_errors++;
 	}
 
 	/*
@@ -1799,7 +1816,6 @@ vdev_raidz_io_done_verified(zio_t *zio, raidz_row_t *rr)
 	    (zio->io_flags & ZIO_FLAG_RESILVER)) {
 		int n = raidz_parity_verify(zio, rr);
 		unexpected_errors += n;
-		ASSERT3U(parity_errors + n, <=, rr->rr_firstdatacol);
 	}
 
 	if (zio->io_error == 0 && spa_writeable(zio->io_spa) &&
@@ -1925,7 +1941,7 @@ raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
 					 */
 					if (rc->rc_error == 0 &&
 					    c >= rr->rr_firstdatacol) {
-						raidz_checksum_error(zio,
+						vdev_raidz_checksum_error(zio,
 						    rc, rc->rc_orig_data);
 						rc->rc_error =
 						    SET_ERROR(ECKSUM);
@@ -2149,9 +2165,20 @@ vdev_raidz_io_done_reconstruct_known_missing(zio_t *zio, raidz_map_t *rm,
 	for (int c = 0; c < rr->rr_cols; c++) {
 		raidz_col_t *rc = &rr->rr_col[c];
 
-		if (rc->rc_error) {
-			ASSERT(rc->rc_error != ECKSUM);	/* child has no bp */
+		/*
+		 * If scrubbing and a replacing/sparing child vdev determined
+		 * that not all of its children have an identical copy of the
+		 * data, then clear the error so the column is treated like
+		 * any other read and force a repair to correct the damage.
+		 */
+		if (rc->rc_error == ECKSUM) {
+			ASSERT(zio->io_flags & ZIO_FLAG_SCRUB);
+			vdev_raidz_checksum_error(zio, rc, rc->rc_abd);
+			rc->rc_force_repair = 1;
+			rc->rc_error = 0;
+		}
 
+		if (rc->rc_error) {
 			if (c < rr->rr_firstdatacol)
 				parity_errors++;
 			else
@@ -2398,6 +2425,8 @@ static void
 vdev_raidz_xlate(vdev_t *cvd, const range_seg64_t *logical_rs,
     range_seg64_t *physical_rs, range_seg64_t *remain_rs)
 {
+	(void) remain_rs;
+
 	vdev_t *raidvd = cvd->vdev_parent;
 	ASSERT(raidvd->vdev_ops == &vdev_raidz_ops);
 

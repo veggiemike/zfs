@@ -2438,7 +2438,14 @@ print_status_config(zpool_handle_t *zhp, status_cbdata_t *cb, const char *name,
 	(void) nvlist_lookup_uint64_array(root, ZPOOL_CONFIG_SCAN_STATS,
 	    (uint64_t **)&ps, &c);
 
-	if (ps != NULL && ps->pss_state == DSS_SCANNING && children == 0) {
+	/*
+	 * If you force fault a drive that's resilvering, its scan stats can
+	 * get frozen in time, giving the false impression that it's
+	 * being resilvered.  That's why we check the state to see if the vdev
+	 * is healthy before reporting "resilvering" or "repairing".
+	 */
+	if (ps != NULL && ps->pss_state == DSS_SCANNING && children == 0 &&
+	    vs->vs_state == VDEV_STATE_HEALTHY) {
 		if (vs->vs_scan_processed != 0) {
 			(void) printf(gettext("  (%s)"),
 			    (ps->pss_func == POOL_SCAN_RESILVER) ?
@@ -2450,7 +2457,7 @@ print_status_config(zpool_handle_t *zhp, status_cbdata_t *cb, const char *name,
 
 	/* The top-level vdevs have the rebuild stats */
 	if (vrs != NULL && vrs->vrs_state == VDEV_REBUILD_ACTIVE &&
-	    children == 0) {
+	    children == 0 && vs->vs_state == VDEV_STATE_HEALTHY) {
 		if (vs->vs_rebuild_processed != 0) {
 			(void) printf(gettext("  (resilvering)"));
 		}
@@ -4198,6 +4205,8 @@ print_iostat_header_impl(iostat_cbdata_t *cb, unsigned int force_column_width,
 	unsigned int namewidth;
 	const char *title;
 
+	color_start(ANSI_BOLD);
+
 	if (cb->cb_flags & IOS_ANYHISTO_M) {
 		title = histo_to_title[IOS_HISTO_IDX(cb->cb_flags)];
 	} else if (cb->cb_vdev_names_count) {
@@ -4231,6 +4240,8 @@ print_iostat_header_impl(iostat_cbdata_t *cb, unsigned int force_column_width,
 	if (cb->vcdl != NULL)
 		print_cmd_columns(cb->vcdl, 1);
 
+	color_end();
+
 	printf("\n");
 }
 
@@ -4240,6 +4251,37 @@ print_iostat_header(iostat_cbdata_t *cb)
 	print_iostat_header_impl(cb, 0, NULL);
 }
 
+/*
+ * Prints a size string (i.e. 120M) with the suffix ("M") colored
+ * by order of magnitude. Uses column_size to add padding.
+ */
+static void
+print_stat_color(const char *statbuf, unsigned int column_size)
+{
+	fputs("  ", stdout);
+	size_t len = strlen(statbuf);
+	while (len < column_size) {
+		fputc(' ', stdout);
+		column_size--;
+	}
+	if (*statbuf == '0') {
+		color_start(ANSI_GRAY);
+		fputc('0', stdout);
+	} else {
+		for (; *statbuf; statbuf++) {
+			if (*statbuf == 'K') color_start(ANSI_GREEN);
+			else if (*statbuf == 'M') color_start(ANSI_YELLOW);
+			else if (*statbuf == 'G') color_start(ANSI_RED);
+			else if (*statbuf == 'T') color_start(ANSI_BOLD_BLUE);
+			else if (*statbuf == 'P') color_start(ANSI_MAGENTA);
+			else if (*statbuf == 'E') color_start(ANSI_CYAN);
+			fputc(*statbuf, stdout);
+			if (--column_size <= 0)
+				break;
+		}
+	}
+	color_end();
+}
 
 /*
  * Display a single statistic.
@@ -4255,7 +4297,7 @@ print_one_stat(uint64_t value, enum zfs_nicenum_format format,
 	if (scripted)
 		printf("\t%s", buf);
 	else
-		printf("  %*s", column_size, buf);
+		print_stat_color(buf, column_size);
 }
 
 /*
@@ -4825,7 +4867,7 @@ children:
 			continue;
 
 		vname = zpool_vdev_name(g_zfs, zhp, newchild[c],
-		    cb->cb_name_flags);
+		    cb->cb_name_flags | VDEV_NAME_TYPE_ID);
 		ret += print_vdev_stats(zhp, vname, oldnv ? oldchild[c] : NULL,
 		    newchild[c], cb, depth + 2);
 		free(vname);
@@ -4868,7 +4910,7 @@ children:
 			}
 
 			vname = zpool_vdev_name(g_zfs, zhp, newchild[c],
-			    cb->cb_name_flags);
+			    cb->cb_name_flags | VDEV_NAME_TYPE_ID);
 			ret += print_vdev_stats(zhp, vname, oldnv ?
 			    oldchild[c] : NULL, newchild[c], cb, depth + 2);
 			free(vname);
@@ -5407,7 +5449,13 @@ print_zpool_dir_scripts(char *dirpath)
 	if ((dir = opendir(dirpath)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir(dir)) != NULL) {
-			sprintf(fullpath, "%s/%s", dirpath, ent->d_name);
+			if (snprintf(fullpath, sizeof (fullpath), "%s/%s",
+			    dirpath, ent->d_name) >= sizeof (fullpath)) {
+				(void) fprintf(stderr,
+				    gettext("internal error: "
+				    "ZPOOL_SCRIPTS_PATH too large.\n"));
+				exit(1);
+			}
 
 			/* Print the scripts */
 			if (stat(fullpath, &dir_stat) == 0)
@@ -5458,8 +5506,8 @@ get_namewidth_iostat(zpool_handle_t *zhp, void *data)
 	 * get_namewidth() returns the maximum width of any name in that column
 	 * for any pool/vdev/device line that will be output.
 	 */
-	width = get_namewidth(zhp, cb->cb_namewidth, cb->cb_name_flags,
-	    cb->cb_verbose);
+	width = get_namewidth(zhp, cb->cb_namewidth,
+	    cb->cb_name_flags | VDEV_NAME_TYPE_ID, cb->cb_verbose);
 
 	/*
 	 * The width we are calculating is the width of the header and also the
@@ -6035,6 +6083,7 @@ print_one_column(zpool_prop_t prop, uint64_t value, const char *str,
 	size_t width = zprop_width(prop, &fixed, ZFS_TYPE_POOL);
 
 	switch (prop) {
+	case ZPOOL_PROP_SIZE:
 	case ZPOOL_PROP_EXPANDSZ:
 	case ZPOOL_PROP_CHECKPOINT:
 	case ZPOOL_PROP_DEDUPRATIO:
@@ -6130,8 +6179,12 @@ print_list_stats(zpool_handle_t *zhp, const char *name, nvlist_t *nv,
 		 * 'toplevel' boolean value is passed to the print_one_column()
 		 * to indicate that the value is valid.
 		 */
-		print_one_column(ZPOOL_PROP_SIZE, vs->vs_space, NULL, scripted,
-		    toplevel, format);
+		if (vs->vs_pspace)
+			print_one_column(ZPOOL_PROP_SIZE, vs->vs_pspace, NULL,
+			    scripted, B_TRUE, format);
+		else
+			print_one_column(ZPOOL_PROP_SIZE, vs->vs_space, NULL,
+			    scripted, toplevel, format);
 		print_one_column(ZPOOL_PROP_ALLOCATED, vs->vs_alloc, NULL,
 		    scripted, toplevel, format);
 		print_one_column(ZPOOL_PROP_FREE, vs->vs_space - vs->vs_alloc,
@@ -6182,7 +6235,7 @@ print_list_stats(zpool_handle_t *zhp, const char *name, nvlist_t *nv,
 			continue;
 
 		vname = zpool_vdev_name(g_zfs, zhp, child[c],
-		    cb->cb_name_flags);
+		    cb->cb_name_flags | VDEV_NAME_TYPE_ID);
 		print_list_stats(zhp, vname, child[c], cb, depth + 2, B_FALSE);
 		free(vname);
 	}
@@ -6216,7 +6269,7 @@ print_list_stats(zpool_handle_t *zhp, const char *name, nvlist_t *nv,
 				printed = B_TRUE;
 			}
 			vname = zpool_vdev_name(g_zfs, zhp, child[c],
-			    cb->cb_name_flags);
+			    cb->cb_name_flags | VDEV_NAME_TYPE_ID);
 			print_list_stats(zhp, vname, child[c], cb, depth + 2,
 			    B_FALSE);
 			free(vname);
@@ -6282,8 +6335,8 @@ get_namewidth_list(zpool_handle_t *zhp, void *data)
 	list_cbdata_t *cb = data;
 	int width;
 
-	width = get_namewidth(zhp, cb->cb_namewidth, cb->cb_name_flags,
-	    cb->cb_verbose);
+	width = get_namewidth(zhp, cb->cb_namewidth,
+	    cb->cb_name_flags | VDEV_NAME_TYPE_ID, cb->cb_verbose);
 
 	if (width < 9)
 		width = 9;

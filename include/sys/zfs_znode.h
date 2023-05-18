@@ -190,7 +190,6 @@ typedef struct znode {
 	boolean_t	z_is_sa;	/* are we native sa? */
 	boolean_t	z_is_mapped;	/* are we mmap'ed */
 	boolean_t	z_is_ctldir;	/* are we .zfs entry */
-	boolean_t	z_is_stale;	/* are we stale due to rollback? */
 	boolean_t	z_suspended;	/* extra ref from a suspend? */
 	uint_t		z_blksz;	/* block size in bytes */
 	uint_t		z_seq;		/* modification sequence number */
@@ -218,9 +217,9 @@ typedef struct znode {
 
 typedef struct znode_hold {
 	uint64_t	zh_obj;		/* object id */
-	kmutex_t	zh_lock;	/* lock serializing object access */
 	avl_node_t	zh_node;	/* avl tree linkage */
-	zfs_refcount_t	zh_refcount;	/* active consumer reference count */
+	kmutex_t	zh_lock;	/* lock serializing object access */
+	int		zh_refcount;	/* active consumer reference count */
 } znode_hold_t;
 
 static inline uint64_t

@@ -44,6 +44,9 @@
 #include <strings.h>
 #include <unistd.h>
 #include <math.h>
+#if LIBFETCH_DYNAMIC
+#include <dlfcn.h>
+#endif
 #include <sys/stat.h>
 #include <sys/mnttab.h>
 #include <sys/mntent.h>
@@ -167,6 +170,8 @@ libzfs_error_description(libzfs_handle_t *hdl)
 		return (dgettext(TEXT_DOMAIN, "I/O error"));
 	case EZFS_INTR:
 		return (dgettext(TEXT_DOMAIN, "signal received"));
+	case EZFS_CKSUM:
+		return (dgettext(TEXT_DOMAIN, "insufficient replicas"));
 	case EZFS_ISSPARE:
 		return (dgettext(TEXT_DOMAIN, "device is reserved as a hot "
 		    "spare"));
@@ -388,6 +393,10 @@ zfs_common_error(libzfs_handle_t *hdl, int error, const char *fmt,
 
 	case EINTR:
 		zfs_verror(hdl, EZFS_INTR, fmt, ap);
+		return (-1);
+
+	case ECKSUM:
+		zfs_verror(hdl, EZFS_CKSUM, fmt, ap);
 		return (-1);
 	}
 
@@ -671,7 +680,7 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case ENOSPC:
 	case EDQUOT:
 		zfs_verror(hdl, EZFS_NOSPC, fmt, ap);
-		return (-1);
+		break;
 
 	case EAGAIN:
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
@@ -1101,6 +1110,11 @@ libzfs_fini(libzfs_handle_t *hdl)
 	libzfs_core_fini();
 	regfree(&hdl->libzfs_urire);
 	fletcher_4_fini();
+#if LIBFETCH_DYNAMIC
+	if (hdl->libfetch != (void *)-1 && hdl->libfetch != NULL)
+		(void) dlclose(hdl->libfetch);
+	free(hdl->libfetch_load_error);
+#endif
 	free(hdl);
 }
 
@@ -2013,7 +2027,7 @@ zfs_version_print(void)
  * Return 1 if the user requested ANSI color output, and our terminal supports
  * it.  Return 0 for no color.
  */
-static int
+int
 use_color(void)
 {
 	static int use_color = -1;
@@ -2059,31 +2073,38 @@ use_color(void)
 }
 
 /*
- * color_start() and color_end() are used for when you want to colorize a block
- * of text.  For example:
+ * The functions color_start() and color_end() are used for when you want
+ * to colorize a block of text.
  *
- * color_start(ANSI_RED_FG)
+ * For example:
+ * color_start(ANSI_RED)
  * printf("hello");
  * printf("world");
  * color_end();
  */
 void
-color_start(char *color)
+color_start(const char *color)
 {
-	if (use_color())
-		printf("%s", color);
+	if (color && use_color()) {
+		fputs(color, stdout);
+		fflush(stdout);
+	}
 }
 
 void
 color_end(void)
 {
-	if (use_color())
-		printf(ANSI_RESET);
+	if (use_color()) {
+		fputs(ANSI_RESET, stdout);
+		fflush(stdout);
+	}
 }
 
-/* printf() with a color.  If color is NULL, then do a normal printf. */
+/*
+ * printf() with a color. If color is NULL, then do a normal printf.
+ */
 int
-printf_color(char *color, char *format, ...)
+printf_color(const char *color, char *format, ...)
 {
 	va_list aptr;
 	int rc;

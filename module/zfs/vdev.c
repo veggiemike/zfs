@@ -134,7 +134,15 @@ int zfs_vdev_standard_sm_blksz = (1 << 17);
  */
 int zfs_nocacheflush = 0;
 
-uint64_t zfs_vdev_max_auto_ashift = ASHIFT_MAX;
+/*
+ * Maximum and minimum ashift values that can be automatically set based on
+ * vdev's physical ashift (disk's physical sector size).  While ASHIFT_MAX
+ * is higher than the maximum value, it is intentionally limited here to not
+ * excessively impact pool space efficiency.  Higher ashift values may still
+ * be forced by vdev logical ashift or by user via ashift property, but won't
+ * be set automatically as a performance optimization.
+ */
+uint64_t zfs_vdev_max_auto_ashift = 14;
 uint64_t zfs_vdev_min_auto_ashift = ASHIFT_MIN;
 
 /*PRINTFLIKE2*/
@@ -262,11 +270,12 @@ vdev_get_mg(vdev_t *vd, metaslab_class_t *mc)
 		return (vd->vdev_mg);
 }
 
-/* ARGSUSED */
 void
 vdev_default_xlate(vdev_t *vd, const range_seg64_t *logical_rs,
     range_seg64_t *physical_rs, range_seg64_t *remain_rs)
 {
+	(void) vd, (void) remain_rs;
+
 	physical_rs->rs_start = logical_rs->rs_start;
 	physical_rs->rs_end = logical_rs->rs_end;
 }
@@ -1512,13 +1521,6 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 	if (txg == 0)
 		spa_config_exit(spa, SCL_ALLOC, FTAG);
 
-	/*
-	 * Regardless whether this vdev was just added or it is being
-	 * expanded, the metaslab count has changed. Recalculate the
-	 * block limit.
-	 */
-	spa_log_sm_set_blocklimit(spa);
-
 	return (0);
 }
 
@@ -1768,6 +1770,7 @@ vdev_uses_zvols(vdev_t *vd)
 static boolean_t
 vdev_default_open_children_func(vdev_t *vd)
 {
+	(void) vd;
 	return (B_TRUE);
 }
 
@@ -1841,6 +1844,24 @@ vdev_set_deflate_ratio(vdev_t *vd)
 }
 
 /*
+ * Choose the best of two ashifts, preferring one between logical ashift
+ * (absolute minimum) and administrator defined maximum, otherwise take
+ * the biggest of the two.
+ */
+uint64_t
+vdev_best_ashift(uint64_t logical, uint64_t a, uint64_t b)
+{
+	if (a > logical && a <= zfs_vdev_max_auto_ashift) {
+		if (b <= logical || b > zfs_vdev_max_auto_ashift)
+			return (a);
+		else
+			return (MAX(a, b));
+	} else if (b <= logical || b > zfs_vdev_max_auto_ashift)
+		return (MAX(a, b));
+	return (b);
+}
+
+/*
  * Maximize performance by inflating the configured ashift for top level
  * vdevs to be as close to the physical ashift as possible while maintaining
  * administrator defined limits and ensuring it doesn't go below the
@@ -1851,7 +1872,8 @@ vdev_ashift_optimize(vdev_t *vd)
 {
 	ASSERT(vd == vd->vdev_top);
 
-	if (vd->vdev_ashift < vd->vdev_physical_ashift) {
+	if (vd->vdev_ashift < vd->vdev_physical_ashift &&
+	    vd->vdev_physical_ashift <= zfs_vdev_max_auto_ashift) {
 		vd->vdev_ashift = MIN(
 		    MAX(zfs_vdev_max_auto_ashift, vd->vdev_ashift),
 		    MAX(zfs_vdev_min_auto_ashift,
@@ -1916,6 +1938,14 @@ vdev_open(vdev_t *vd)
 
 	error = vd->vdev_ops->vdev_op_open(vd, &osize, &max_osize,
 	    &logical_ashift, &physical_ashift);
+
+	/* Keep the device in removed state if unplugged */
+	if (error == ENOENT && vd->vdev_removed) {
+		vdev_set_state(vd, B_TRUE, VDEV_STATE_REMOVED,
+		    VDEV_AUX_NONE);
+		return (error);
+	}
+
 	/*
 	 * Physical volume size should never be larger than its max size, unless
 	 * the disk has shrunk while we were reading it or the device is buggy
@@ -2849,6 +2879,8 @@ boolean_t
 vdev_default_need_resilver(vdev_t *vd, const dva_t *dva, size_t psize,
     uint64_t phys_birth)
 {
+	(void) dva, (void) psize;
+
 	/* Set by sequential resilver. */
 	if (phys_birth == TXG_UNKNOWN)
 		return (B_TRUE);
@@ -3132,6 +3164,34 @@ vdev_dtl_reassess(vdev_t *vd, uint64_t txg, uint64_t scrub_txg,
 	mutex_exit(&vd->vdev_dtl_lock);
 }
 
+/*
+ * Iterate over all the vdevs except spare, and post kobj events
+ */
+void
+vdev_post_kobj_evt(vdev_t *vd)
+{
+	if (vd->vdev_ops->vdev_op_kobj_evt_post &&
+	    vd->vdev_kobj_flag == B_FALSE) {
+		vd->vdev_kobj_flag = B_TRUE;
+		vd->vdev_ops->vdev_op_kobj_evt_post(vd);
+	}
+
+	for (int c = 0; c < vd->vdev_children; c++)
+		vdev_post_kobj_evt(vd->vdev_child[c]);
+}
+
+/*
+ * Iterate over all the vdevs except spare, and clear kobj events
+ */
+void
+vdev_clear_kobj_evt(vdev_t *vd)
+{
+	vd->vdev_kobj_flag = B_FALSE;
+
+	for (int c = 0; c < vd->vdev_children; c++)
+		vdev_clear_kobj_evt(vd->vdev_child[c]);
+}
+
 int
 vdev_dtl_load(vdev_t *vd)
 {
@@ -3142,6 +3202,12 @@ vdev_dtl_load(vdev_t *vd)
 
 	if (vd->vdev_ops->vdev_op_leaf && vd->vdev_dtl_object != 0) {
 		ASSERT(vdev_is_concrete(vd));
+
+		/*
+		 * If the dtl cannot be sync'd there is no need to open it.
+		 */
+		if (spa->spa_mode == SPA_MODE_READ && !spa->spa_read_spacemaps)
+			return (0);
 
 		error = space_map_open(&vd->vdev_dtl_sm, mos,
 		    vd->vdev_dtl_object, 0, -1ULL, 0);
@@ -3906,6 +3972,29 @@ vdev_degrade(spa_t *spa, uint64_t guid, vdev_aux_t aux)
 	return (spa_vdev_state_exit(spa, vd, 0));
 }
 
+int
+vdev_remove_wanted(spa_t *spa, uint64_t guid)
+{
+	vdev_t *vd;
+
+	spa_vdev_state_enter(spa, SCL_NONE);
+
+	if ((vd = spa_lookup_by_guid(spa, guid, B_TRUE)) == NULL)
+		return (spa_vdev_state_exit(spa, NULL, SET_ERROR(ENODEV)));
+
+	/*
+	 * If the vdev is already removed, then don't do anything.
+	 */
+	if (vd->vdev_removed)
+		return (spa_vdev_state_exit(spa, NULL, 0));
+
+	vd->vdev_remove_wanted = B_TRUE;
+	spa_async_request(spa, SPA_ASYNC_REMOVE);
+
+	return (spa_vdev_state_exit(spa, vd, 0));
+}
+
+
 /*
  * Online the given vdev.
  *
@@ -4149,9 +4238,9 @@ vdev_clear(spa_t *spa, vdev_t *vd)
 		vdev_clear(spa, vd->vdev_child[c]);
 
 	/*
-	 * It makes no sense to "clear" an indirect vdev.
+	 * It makes no sense to "clear" an indirect  or removed vdev.
 	 */
-	if (!vdev_is_concrete(vd))
+	if (!vdev_is_concrete(vd) || vd->vdev_removed)
 		return;
 
 	/*
@@ -4291,6 +4380,8 @@ vdev_get_child_stat(vdev_t *cvd, vdev_stat_t *vs, vdev_stat_t *cvs)
 static void
 vdev_get_child_stat_ex(vdev_t *cvd, vdev_stat_ex_t *vsx, vdev_stat_ex_t *cvsx)
 {
+	(void) cvd;
+
 	int t, b;
 	for (t = 0; t < ZIO_TYPES; t++) {
 		for (b = 0; b < ARRAY_SIZE(vsx->vsx_disk_histo[0]); b++)
@@ -4401,6 +4492,7 @@ vdev_get_stats_ex(vdev_t *vd, vdev_stat_t *vs, vdev_stat_ex_t *vsx)
 		vs->vs_rsize = vdev_get_min_asize(vd);
 
 		if (vd->vdev_ops->vdev_op_leaf) {
+			vs->vs_pspace = vd->vdev_psize;
 			vs->vs_rsize += VDEV_LABEL_START_SIZE +
 			    VDEV_LABEL_END_SIZE;
 			/*
@@ -4446,7 +4538,10 @@ vdev_get_stats_ex(vdev_t *vd, vdev_stat_t *vs, vdev_stat_ex_t *vsx)
 		vs->vs_configured_ashift = vd->vdev_top != NULL
 		    ? vd->vdev_top->vdev_ashift : vd->vdev_ashift;
 		vs->vs_logical_ashift = vd->vdev_logical_ashift;
-		vs->vs_physical_ashift = vd->vdev_physical_ashift;
+		if (vd->vdev_physical_ashift <= ASHIFT_MAX)
+			vs->vs_physical_ashift = vd->vdev_physical_ashift;
+		else
+			vs->vs_physical_ashift = 0;
 
 		/*
 		 * Report fragmentation and rebuild progress for top-level,
@@ -4727,6 +4822,7 @@ void
 vdev_space_update(vdev_t *vd, int64_t alloc_delta, int64_t defer_delta,
     int64_t space_delta)
 {
+	(void) defer_delta;
 	int64_t dspace_delta;
 	spa_t *spa = vd->vdev_spa;
 	vdev_t *rvd = spa->spa_root_vdev;

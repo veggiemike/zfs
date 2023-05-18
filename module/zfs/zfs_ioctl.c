@@ -1921,6 +1921,10 @@ zfs_ioc_vdev_set_state(zfs_cmd_t *zc)
 		error = vdev_degrade(spa, zc->zc_guid, zc->zc_obj);
 		break;
 
+	case VDEV_STATE_REMOVED:
+		error = vdev_remove_wanted(spa, zc->zc_guid);
+		break;
+
 	default:
 		error = SET_ERROR(EINVAL);
 	}
@@ -2928,7 +2932,7 @@ zfs_ioc_pool_set_props(zfs_cmd_t *zc)
 		mutex_enter(&spa_namespace_lock);
 		if ((spa = spa_lookup(zc->zc_name)) != NULL) {
 			spa_configfile_set(spa, props, B_FALSE);
-			spa_write_cachefile(spa, B_FALSE, B_TRUE);
+			spa_write_cachefile(spa, B_FALSE, B_TRUE, B_FALSE);
 		}
 		mutex_exit(&spa_namespace_lock);
 		if (spa != NULL) {
@@ -4787,6 +4791,11 @@ extract_delay_props(nvlist_t *props)
 	static const zfs_prop_t delayable[] = {
 		ZFS_PROP_REFQUOTA,
 		ZFS_PROP_KEYLOCATION,
+		/*
+		 * Setting ZFS_PROP_SHARESMB requires the objset type to be
+		 * known, which is not possible prior to receipt of raw sends.
+		 */
+		ZFS_PROP_SHARESMB,
 		0
 	};
 	int i;
@@ -4850,6 +4859,7 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, char *origin, nvlist_t *recvprops,
 	offset_t off, noff;
 	nvlist_t *local_delayprops = NULL;
 	nvlist_t *recv_delayprops = NULL;
+	nvlist_t *inherited_delayprops = NULL;
 	nvlist_t *origprops = NULL; /* existing properties */
 	nvlist_t *origrecvd = NULL; /* existing received properties */
 	boolean_t first_recvd_props = B_FALSE;
@@ -4964,6 +4974,7 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, char *origin, nvlist_t *recvprops,
 		local_delayprops = extract_delay_props(oprops);
 		(void) zfs_set_prop_nvlist(tofs, ZPROP_SRC_LOCAL,
 		    oprops, *errors);
+		inherited_delayprops = extract_delay_props(xprops);
 		(void) zfs_set_prop_nvlist(tofs, ZPROP_SRC_INHERITED,
 		    xprops, *errors);
 
@@ -5021,6 +5032,10 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, char *origin, nvlist_t *recvprops,
 			(void) zfs_set_prop_nvlist(tofs, ZPROP_SRC_LOCAL,
 			    local_delayprops, *errors);
 		}
+		if (inherited_delayprops != NULL && error == 0) {
+			(void) zfs_set_prop_nvlist(tofs, ZPROP_SRC_INHERITED,
+			    inherited_delayprops, *errors);
+		}
 	}
 
 	/*
@@ -5039,6 +5054,10 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, char *origin, nvlist_t *recvprops,
 	if (local_delayprops != NULL) {
 		ASSERT(nvlist_merge(localprops, local_delayprops, 0) == 0);
 		nvlist_free(local_delayprops);
+	}
+	if (inherited_delayprops != NULL) {
+		ASSERT(nvlist_merge(localprops, inherited_delayprops, 0) == 0);
+		nvlist_free(inherited_delayprops);
 	}
 	*read_bytes = off - noff;
 
@@ -7383,7 +7402,7 @@ zfsdev_get_state_impl(minor_t minor, enum zfsdev_state_type which)
 
 	for (zs = zfsdev_state_list; zs != NULL; zs = zs->zs_next) {
 		if (zs->zs_minor == minor) {
-			smp_rmb();
+			membar_consumer();
 			switch (which) {
 			case ZST_ONEXIT:
 				return (zs->zs_onexit);

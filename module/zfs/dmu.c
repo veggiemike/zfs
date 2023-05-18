@@ -28,6 +28,7 @@
  * Copyright (c) 2019 Datto Inc.
  * Copyright (c) 2019, Klara Inc.
  * Copyright (c) 2019, Allan Jude
+ * Copyright (c) 2022 Hewlett Packard Enterprise Development LP.
  */
 
 #include <sys/dmu.h>
@@ -70,12 +71,16 @@ int zfs_nopwrite_enabled = 1;
  * will wait until the next TXG.
  * A value of zero will disable this throttle.
  */
-unsigned long zfs_per_txg_dirty_frees_percent = 5;
+unsigned long zfs_per_txg_dirty_frees_percent = 30;
 
 /*
- * Enable/disable forcing txg sync when dirty in dmu_offset_next.
+ * Enable/disable forcing txg sync when dirty checking for holes with lseek().
+ * By default this is enabled to ensure accurate hole reporting, it can result
+ * in a significant performance penalty for lseek(SEEK_HOLE) heavy workloads.
+ * Disabling this option will result in holes never being reported in dirty
+ * files which is always safe.
  */
-int zfs_dmu_offset_next_sync = 0;
+int zfs_dmu_offset_next_sync = 1;
 
 /*
  * Limit the amount we can prefetch with one call to this amount.  This
@@ -812,13 +817,14 @@ get_next_chunk(dnode_t *dn, uint64_t *start, uint64_t minimum, uint64_t *l1blks)
  * otherwise return false.
  * Used below in dmu_free_long_range_impl() to enable abort when unmounting
  */
-/*ARGSUSED*/
 static boolean_t
 dmu_objset_zfs_unmounting(objset_t *os)
 {
 #ifdef _KERNEL
 	if (dmu_objset_type(os) == DMU_OST_ZFS)
 		return (zfs_get_vfs_flag_unmounted(os));
+#else
+	(void) os;
 #endif
 	return (B_FALSE);
 }
@@ -1502,10 +1508,10 @@ typedef struct {
 	dmu_tx_t		*dsa_tx;
 } dmu_sync_arg_t;
 
-/* ARGSUSED */
 static void
 dmu_sync_ready(zio_t *zio, arc_buf_t *buf, void *varg)
 {
+	(void) buf;
 	dmu_sync_arg_t *dsa = varg;
 	dmu_buf_t *db = dsa->dsa_zgd->zgd_db;
 	blkptr_t *bp = zio->io_bp;
@@ -1530,10 +1536,10 @@ dmu_sync_late_arrival_ready(zio_t *zio)
 	dmu_sync_ready(zio, NULL, zio->io_private);
 }
 
-/* ARGSUSED */
 static void
 dmu_sync_done(zio_t *zio, arc_buf_t *buf, void *varg)
 {
+	(void) buf;
 	dmu_sync_arg_t *dsa = varg;
 	dbuf_dirty_record_t *dr = dsa->dsa_dr;
 	dmu_buf_impl_t *db = dr->dr_dbuf;
@@ -1841,7 +1847,7 @@ dmu_sync(zio_t *pio, uint64_t txg, dmu_sync_cb_t *done, zgd_t *zgd)
 	dsa->dsa_tx = NULL;
 
 	zio_nowait(arc_write(pio, os->os_spa, txg,
-	    zgd->zgd_bp, dr->dt.dl.dr_data, DBUF_IS_L2CACHEABLE(db),
+	    zgd->zgd_bp, dr->dt.dl.dr_data, dbuf_is_l2cacheable(db),
 	    &zp, dmu_sync_ready, NULL, NULL, dmu_sync_done, dsa,
 	    ZIO_PRIORITY_SYNC_WRITE, ZIO_FLAG_CANFAIL, &zb));
 
@@ -1983,12 +1989,22 @@ dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp, zio_prop_t *zp)
 		    ZCHECKSUM_FLAG_EMBEDDED))
 			checksum = ZIO_CHECKSUM_FLETCHER_4;
 
-		if (os->os_redundant_metadata == ZFS_REDUNDANT_METADATA_ALL ||
-		    (os->os_redundant_metadata ==
-		    ZFS_REDUNDANT_METADATA_MOST &&
-		    (level >= zfs_redundant_metadata_most_ditto_level ||
-		    DMU_OT_IS_METADATA(type) || (wp & WP_SPILL))))
+		switch (os->os_redundant_metadata) {
+		case ZFS_REDUNDANT_METADATA_ALL:
 			copies++;
+			break;
+		case ZFS_REDUNDANT_METADATA_MOST:
+			if (level >= zfs_redundant_metadata_most_ditto_level ||
+			    DMU_OT_IS_METADATA(type) || (wp & WP_SPILL))
+				copies++;
+			break;
+		case ZFS_REDUNDANT_METADATA_SOME:
+			if (DMU_OT_IS_CRITICAL(type))
+				copies++;
+			break;
+		case ZFS_REDUNDANT_METADATA_NONE:
+			break;
+		}
 	} else if (wp & WP_NOFILL) {
 		ASSERT(level == 0);
 
@@ -2084,18 +2100,18 @@ dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp, zio_prop_t *zp)
 }
 
 /*
- * This function is only called from zfs_holey_common() for zpl_llseek()
- * in order to determine the location of holes.  In order to accurately
- * report holes all dirty data must be synced to disk.  This causes extremely
- * poor performance when seeking for holes in a dirty file.  As a compromise,
- * only provide hole data when the dnode is clean.  When a dnode is dirty
- * report the dnode as having no holes which is always a safe thing to do.
+ * Reports the location of data and holes in an object.  In order to
+ * accurately report holes all dirty data must be synced to disk.  This
+ * causes extremely poor performance when seeking for holes in a dirty file.
+ * As a compromise, only provide hole data when the dnode is clean.  When
+ * a dnode is dirty report the dnode as having no holes by returning EBUSY
+ * which is always safe to do.
  */
 int
 dmu_offset_next(objset_t *os, uint64_t object, boolean_t hole, uint64_t *off)
 {
 	dnode_t *dn;
-	int err;
+	int restarted = 0, err;
 
 restart:
 	err = dnode_hold(os, object, FTAG, &dn);
@@ -2107,19 +2123,23 @@ restart:
 	if (dnode_is_dirty(dn)) {
 		/*
 		 * If the zfs_dmu_offset_next_sync module option is enabled
-		 * then strict hole reporting has been requested.  Dirty
-		 * dnodes must be synced to disk to accurately report all
-		 * holes.  When disabled (the default) dirty dnodes are
-		 * reported to not have any holes which is always safe.
+		 * then hole reporting has been requested.  Dirty dnodes
+		 * must be synced to disk to accurately report holes.
 		 *
-		 * When called by zfs_holey_common() the zp->z_rangelock
-		 * is held to prevent zfs_write() and mmap writeback from
-		 * re-dirtying the dnode after txg_wait_synced().
+		 * Provided a RL_READER rangelock spanning 0-UINT64_MAX is
+		 * held by the caller only a single restart will be required.
+		 * We tolerate callers which do not hold the rangelock by
+		 * returning EBUSY and not reporting holes after one restart.
 		 */
 		if (zfs_dmu_offset_next_sync) {
 			rw_exit(&dn->dn_struct_rwlock);
 			dnode_rele(dn, FTAG);
+
+			if (restarted)
+				return (SET_ERROR(EBUSY));
+
 			txg_wait_synced(dmu_objset_pool(os), 0);
+			restarted = 1;
 			goto restart;
 		}
 
@@ -2274,10 +2294,10 @@ byteswap_uint16_array(void *vbuf, size_t size)
 		buf[i] = BSWAP_16(buf[i]);
 }
 
-/* ARGSUSED */
 void
 byteswap_uint8_array(void *vbuf, size_t size)
 {
+	(void) vbuf, (void) size;
 }
 
 void

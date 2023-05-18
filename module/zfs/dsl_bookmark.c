@@ -347,6 +347,8 @@ dsl_bookmark_set_phys(zfs_bookmark_phys_t *zbm, dsl_dataset_t *snap)
 	spa_t *spa = dsl_dataset_get_spa(snap);
 	objset_t *mos = spa_get_dsl(spa)->dp_meta_objset;
 	dsl_dataset_phys_t *dsp = dsl_dataset_phys(snap);
+
+	memset(zbm, 0, sizeof (zfs_bookmark_phys_t));
 	zbm->zbm_guid = dsp->ds_guid;
 	zbm->zbm_creation_txg = dsp->ds_creation_txg;
 	zbm->zbm_creation_time = dsp->ds_creation_time;
@@ -380,10 +382,6 @@ dsl_bookmark_set_phys(zfs_bookmark_phys_t *zbm, dsl_dataset_t *snap)
 		    &zbm->zbm_compressed_freed_before_next_snap,
 		    &zbm->zbm_uncompressed_freed_before_next_snap);
 		dsl_dataset_rele(nextds, FTAG);
-	} else {
-		bzero(&zbm->zbm_flags,
-		    sizeof (zfs_bookmark_phys_t) -
-		    offsetof(zfs_bookmark_phys_t, zbm_flags));
 	}
 }
 
@@ -1203,7 +1201,6 @@ dsl_redaction_list_long_rele(redaction_list_t *rl, void *tag)
 	(void) zfs_refcount_remove(&rl->rl_longholds, tag);
 }
 
-/* ARGSUSED */
 static void
 redaction_list_evict_sync(void *rlu)
 {
@@ -1470,10 +1467,11 @@ dsl_bookmark_next_changed(dsl_dataset_t *head, dsl_dataset_t *origin,
  * Adjust the FBN of any bookmarks that reference this block, whose "next"
  * is the head dataset.
  */
-/* ARGSUSED */
 void
 dsl_bookmark_block_killed(dsl_dataset_t *ds, const blkptr_t *bp, dmu_tx_t *tx)
 {
+	(void) tx;
+
 	/*
 	 * Iterate over bookmarks whose "next" is the head dataset.
 	 */

@@ -536,6 +536,9 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	 * Acquire vnode lock before making it available to the world.
 	 */
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
+#if __FreeBSD_version >= 1400077
+	vn_set_state(vp, VSTATE_CONSTRUCTED);
+#endif
 	VN_LOCK_AREC(vp);
 	if (vp->v_type != VFIFO)
 		VN_LOCK_ASHARE(vp);
@@ -575,7 +578,6 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	dmu_buf_t	*db;
 	timestruc_t	now;
 	uint64_t	gen, obj;
-	int		err;
 	int		bonuslen;
 	int		dnodesize;
 	sa_handle_t	*sa_hdl;
@@ -815,12 +817,11 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 		VERIFY0(zfs_aclset_common(*zpp, acl_ids->z_aclp, cr, tx));
 	}
 	if (!(flag & IS_ROOT_NODE)) {
-		vnode_t *vp;
-
-		vp = ZTOV(*zpp);
+		vnode_t *vp = ZTOV(*zpp);
 		vp->v_vflag |= VV_FORCEINSMQ;
-		err = insmntque(vp, zfsvfs->z_vfs);
+		int err = insmntque(vp, zfsvfs->z_vfs);
 		vp->v_vflag &= ~VV_FORCEINSMQ;
+		(void) err;
 		KASSERT(err == 0, ("insmntque() failed: error %d", err));
 	}
 	kmem_free(sa_attrs, sizeof (sa_bulk_attr_t) * ZPL_END);
@@ -839,7 +840,9 @@ zfs_xvattr_set(znode_t *zp, xvattr_t *xvap, dmu_tx_t *tx)
 	xoap = xva_getxoptattr(xvap);
 	ASSERT3P(xoap, !=, NULL);
 
-	ASSERT_VOP_IN_SEQC(ZTOV(zp));
+	if (zp->z_zfsvfs->z_replay == B_FALSE) {
+		ASSERT_VOP_IN_SEQC(ZTOV(zp));
+	}
 
 	if (XVA_ISSET_REQ(xvap, XAT_CREATETIME)) {
 		uint64_t times[2];
@@ -932,11 +935,9 @@ zfs_zget(zfsvfs_t *zfsvfs, uint64_t obj_num, znode_t **zpp)
 	znode_t		*zp;
 	vnode_t		*vp;
 	sa_handle_t	*hdl;
-	struct thread	*td;
 	int locked;
 	int err;
 
-	td = curthread;
 	getnewvnode_reserve_();
 again:
 	*zpp = NULL;
@@ -962,7 +963,7 @@ again:
 
 	hdl = dmu_buf_get_user(db);
 	if (hdl != NULL) {
-		zp  = sa_get_userdata(hdl);
+		zp = sa_get_userdata(hdl);
 
 		/*
 		 * Since "SA" does immediate eviction we
@@ -1083,9 +1084,18 @@ zfs_rezget(znode_t *zp)
 	 * the vnode in case of error, but currently we cannot do that
 	 * because of the LOR between the vnode lock and z_teardown_lock.
 	 * So, instead, we have to "doom" the znode in the illumos style.
+	 *
+	 * Ignore invalid pages during the scan.  This is to avoid deadlocks
+	 * between page busying and the teardown lock, as pages are busied prior
+	 * to a VOP_GETPAGES operation, which acquires the teardown read lock.
+	 * Such pages will be invalid and can safely be skipped here.
 	 */
 	vp = ZTOV(zp);
+#if __FreeBSD_version >= 1400042
+	vn_pages_remove_valid(vp, 0, 0);
+#else
 	vn_pages_remove(vp, 0, 0);
+#endif
 
 	ZFS_OBJ_HOLD_ENTER(zfsvfs, obj_num);
 
@@ -1480,12 +1490,16 @@ zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
 	error = dmu_free_long_range(zfsvfs->z_os, zp->z_id, off, len);
 
 	if (error == 0) {
+#if __FreeBSD_version >= 1400032
+		vnode_pager_purge_range(ZTOV(zp), off, off + len);
+#else
 		/*
-		 * In FreeBSD we cannot free block in the middle of a file,
-		 * but only at the end of a file, so this code path should
-		 * never happen.
+		 * Before __FreeBSD_version 1400032 we cannot free block in the
+		 * middle of a file, but only at the end of a file, so this code
+		 * path should never happen.
 		 */
 		vnode_pager_setsize(ZTOV(zp), off);
+#endif
 	}
 
 	zfs_rangelock_exit(lr);

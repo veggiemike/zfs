@@ -579,6 +579,7 @@ zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
 	boolean_t	fuid_dirtied;
 	boolean_t	have_acl = B_FALSE;
 	boolean_t	waited = B_FALSE;
+	boolean_t	skip_acl = (flag & ATTR_NOACLCHECK) ? B_TRUE : B_FALSE;
 
 	/*
 	 * If we have an ephemeral id, ACL, or XVATTR then
@@ -651,7 +652,7 @@ top:
 		 * Create a new file object and update the directory
 		 * to reference it.
 		 */
-		if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
+		if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, skip_acl, cr))) {
 			if (have_acl)
 				zfs_acl_ids_free(&acl_ids);
 			goto out;
@@ -3594,7 +3595,11 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 			dmu_tx_wait(tx);
 
 		dmu_tx_abort(tx);
+#ifdef HAVE_VFS_FILEMAP_DIRTY_FOLIO
+		filemap_dirty_folio(page_mapping(pp), page_folio(pp));
+#else
 		__set_page_dirty_nobuffers(pp);
+#endif
 		ClearPageError(pp);
 		end_page_writeback(pp);
 		zfs_rangelock_exit(lr);
@@ -3634,6 +3639,8 @@ zfs_putpage(struct inode *ip, struct page *pp, struct writeback_control *wbc)
 		 */
 		zil_commit(zfsvfs->z_log, zp->z_id);
 	}
+
+	dataset_kstats_update_write_kstats(&zfsvfs->z_kstat, pglen);
 
 	ZFS_EXIT(zfsvfs);
 	return (err);
@@ -3829,6 +3836,8 @@ zfs_getpage(struct inode *ip, struct page *pl[], int nr_pages)
 	ZFS_VERIFY_ZP(zp);
 
 	err = zfs_fillpage(ip, pl, nr_pages);
+
+	dataset_kstats_update_read_kstats(&zfsvfs->z_kstat, nr_pages*PAGESIZE);
 
 	ZFS_EXIT(zfsvfs);
 	return (err);

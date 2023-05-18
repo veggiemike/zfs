@@ -257,6 +257,32 @@ bio_set_bi_error(struct bio *bio, int error)
 #endif /* HAVE_1ARG_BIO_END_IO_T */
 
 /*
+ * 5.15 MACRO,
+ *   GD_DEAD
+ *
+ * 2.6.36 - 5.14 MACRO,
+ *   GENHD_FL_UP
+ *
+ * Check the disk status and return B_TRUE if alive
+ * otherwise B_FALSE
+ */
+static inline boolean_t
+zfs_check_disk_status(struct block_device *bdev)
+{
+#if defined(GENHD_FL_UP)
+	return (!!(bdev->bd_disk->flags & GENHD_FL_UP));
+#elif defined(GD_DEAD)
+	return (!test_bit(GD_DEAD, &bdev->bd_disk->state));
+#else
+/*
+ * This is encountered if neither GENHD_FL_UP nor GD_DEAD is available in
+ * the kernel - likely due to an MACRO change that needs to be chased down.
+ */
+#error "Unsupported kernel: no usable disk status check"
+#endif
+}
+
+/*
  * 4.1 API,
  * 3.10.0 CentOS 7.x API,
  *   blkdev_reread_part()
@@ -357,7 +383,11 @@ vdev_lookup_bdev(const char *path, dev_t *dev)
 static inline void
 bio_set_op_attrs(struct bio *bio, unsigned rw, unsigned flags)
 {
+#if defined(HAVE_BIO_BI_OPF)
+	bio->bi_opf = rw | flags;
+#else
 	bio->bi_rw |= rw | flags;
+#endif /* HAVE_BIO_BI_OPF */
 }
 #endif
 
@@ -385,7 +415,7 @@ static inline void
 bio_set_flush(struct bio *bio)
 {
 #if defined(HAVE_REQ_PREFLUSH)	/* >= 4.10 */
-	bio_set_op_attrs(bio, 0, REQ_PREFLUSH);
+	bio_set_op_attrs(bio, 0, REQ_PREFLUSH | REQ_OP_WRITE);
 #elif defined(WRITE_FLUSH_FUA)	/* >= 2.6.37 and <= 4.9 */
 	bio_set_op_attrs(bio, 0, WRITE_FLUSH_FUA);
 #else
@@ -495,21 +525,45 @@ blk_queue_discard_granularity(struct request_queue *q, unsigned int dg)
 }
 
 /*
+ * 5.19 API,
+ *   bdev_max_discard_sectors()
+ *
+ * 2.6.32 API,
+ *   blk_queue_discard()
+ */
+static inline boolean_t
+bdev_discard_supported(struct block_device *bdev)
+{
+#if defined(HAVE_BDEV_MAX_DISCARD_SECTORS)
+	return (!!bdev_max_discard_sectors(bdev));
+#elif defined(HAVE_BLK_QUEUE_DISCARD)
+	return (!!blk_queue_discard(bdev_get_queue(bdev)));
+#else
+#error "Unsupported kernel"
+#endif
+}
+
+/*
+ * 5.19 API,
+ *   bdev_max_secure_erase_sectors()
+ *
  * 4.8 API,
  *   blk_queue_secure_erase()
  *
  * 2.6.36 - 4.7 API,
  *   blk_queue_secdiscard()
  */
-static inline int
-blk_queue_discard_secure(struct request_queue *q)
+static inline boolean_t
+bdev_secure_discard_supported(struct block_device *bdev)
 {
-#if defined(HAVE_BLK_QUEUE_SECURE_ERASE)
-	return (blk_queue_secure_erase(q));
+#if defined(HAVE_BDEV_MAX_SECURE_ERASE_SECTORS)
+	return (!!bdev_max_secure_erase_sectors(bdev));
+#elif defined(HAVE_BLK_QUEUE_SECURE_ERASE)
+	return (!!blk_queue_secure_erase(bdev_get_queue(bdev)));
 #elif defined(HAVE_BLK_QUEUE_SECDISCARD)
-	return (blk_queue_secdiscard(q));
+	return (!!blk_queue_secdiscard(bdev_get_queue(bdev)));
 #else
-	return (0);
+#error "Unsupported kernel"
 #endif
 }
 
@@ -527,7 +581,13 @@ blk_generic_start_io_acct(struct request_queue *q __attribute__((unused)),
     struct gendisk *disk __attribute__((unused)),
     int rw __attribute__((unused)), struct bio *bio)
 {
-#if defined(HAVE_DISK_IO_ACCT)
+#if defined(HAVE_BDEV_IO_ACCT_63)
+	return (bdev_start_io_acct(bio->bi_bdev, bio_op(bio),
+	    jiffies));
+#elif defined(HAVE_BDEV_IO_ACCT_OLD)
+	return (bdev_start_io_acct(bio->bi_bdev, bio_sectors(bio),
+	    bio_op(bio), jiffies));
+#elif defined(HAVE_DISK_IO_ACCT)
 	return (disk_start_io_acct(disk, bio_sectors(bio), bio_op(bio)));
 #elif defined(HAVE_BIO_IO_ACCT)
 	return (bio_start_io_acct(bio));
@@ -550,7 +610,12 @@ blk_generic_end_io_acct(struct request_queue *q __attribute__((unused)),
     struct gendisk *disk __attribute__((unused)),
     int rw __attribute__((unused)), struct bio *bio, unsigned long start_time)
 {
-#if defined(HAVE_DISK_IO_ACCT)
+#if defined(HAVE_BDEV_IO_ACCT_63)
+	bdev_end_io_acct(bio->bi_bdev, bio_op(bio), bio_sectors(bio),
+	    start_time);
+#elif defined(HAVE_BDEV_IO_ACCT_OLD)
+	bdev_end_io_acct(bio->bi_bdev, bio_op(bio), start_time);
+#elif defined(HAVE_DISK_IO_ACCT)
 	disk_end_io_acct(disk, bio_op(bio), start_time);
 #elif defined(HAVE_BIO_IO_ACCT)
 	bio_end_io_acct(bio, start_time);
