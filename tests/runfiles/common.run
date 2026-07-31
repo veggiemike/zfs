@@ -82,7 +82,9 @@ tests = ['block_cloning_clone_mmap_cached',
     'block_cloning_copyfilerange_fallback_same_txg',
     'block_cloning_replay', 'block_cloning_replay_encrypted',
     'block_cloning_lwb_buffer_overflow', 'block_cloning_clone_mmap_write',
-    'block_cloning_rlimit_fsize', 'block_cloning_large_offset']
+    'block_cloning_rlimit_fsize', 'block_cloning_large_offset',
+    'block_cloning_after_device_removal',
+    'block_cloning_after_trunc']
 tags = ['functional', 'block_cloning']
 
 [tests/functional/bootfs]
@@ -248,6 +250,10 @@ tags = ['functional', 'cli_root', 'zfs_ids_to_path']
 tests = ['zfs_inherit_001_neg', 'zfs_inherit_002_neg', 'zfs_inherit_003_pos',
     'zfs_inherit_mountpoint']
 tags = ['functional', 'cli_root', 'zfs_inherit']
+
+[tests/functional/cli_root/zfs_list]
+tests = ['zfs_list_009_pos']
+tags = ['functional', 'cli_root', 'zfs_list']
 
 [tests/functional/cli_root/zfs_load-key]
 tests = ['zfs_load-key', 'zfs_load-key_all', 'zfs_load-key_file',
@@ -688,9 +694,10 @@ post =
 tags = ['functional', 'deadman']
 
 [tests/functional/dedup]
-tests = ['dedup_fdt_create', 'dedup_fdt_import', 'dedup_fdt_pacing',
-    'dedup_legacy_create', 'dedup_legacy_import', 'dedup_legacy_fdt_upgrade',
-    'dedup_legacy_fdt_mixed', 'dedup_quota', 'dedup_prune', 'dedup_zap_shrink']
+tests = ['dedup_bclone_pruned', 'dedup_fdt_create', 'dedup_fdt_import',
+    'dedup_fdt_pacing', 'dedup_legacy_create', 'dedup_legacy_import',
+    'dedup_legacy_fdt_upgrade', 'dedup_legacy_fdt_mixed', 'dedup_quota',
+    'dedup_prune', 'dedup_zap_shrink']
 pre =
 post =
 tags = ['functional', 'dedup']
@@ -855,7 +862,8 @@ tags = ['functional', 'quota']
 [tests/functional/redacted_send]
 tests = ['redacted_compressed', 'redacted_contents', 'redacted_deleted',
     'redacted_disabled_feature', 'redacted_embedded', 'redacted_holes',
-    'redacted_incrementals', 'redacted_largeblocks', 'redacted_many_clones',
+    'redacted_incrementals', 'redacted_largeblocks', 'redacted_max_blkid',
+    'redacted_many_clones',
     'redacted_mixed_recsize', 'redacted_mounts', 'redacted_negative',
     'redacted_origin', 'redacted_panic', 'redacted_props', 'redacted_resume',
     'redacted_size', 'redacted_volume']
@@ -872,8 +880,10 @@ timeout = 1200
 [tests/functional/redundancy]
 tests = ['redundancy_draid', 'redundancy_draid1', 'redundancy_draid2',
     'redundancy_draid3', 'redundancy_draid_damaged1',
-    'redundancy_draid_damaged2', 'redundancy_draid_spare1',
-    'redundancy_draid_spare2', 'redundancy_draid_spare3', 'redundancy_mirror',
+    'redundancy_draid_damaged2', 'redundancy_draid_degraded1',
+    'redundancy_draid_degraded2',
+    'redundancy_draid_spare1', 'redundancy_draid_spare2',
+    'redundancy_draid_spare3', 'redundancy_mirror',
     'redundancy_raidz', 'redundancy_raidz1', 'redundancy_raidz2',
     'redundancy_raidz3', 'redundancy_stripe']
 tags = ['functional', 'redundancy']
@@ -905,7 +915,7 @@ tests = ['removal_all_vdev', 'removal_cancel', 'removal_check_space',
     'removal_with_write', 'removal_with_zdb', 'remove_expanded',
     'remove_mirror', 'remove_mirror_sanity', 'remove_raidz',
     'remove_indirect', 'remove_attach_mirror', 'removal_reservation',
-    'removal_with_hole']
+    'removal_with_hole', 'removal_with_missing_log']
 tags = ['functional', 'removal']
 
 [tests/functional/rename_dirs]

@@ -1729,7 +1729,8 @@ again:
 			dmu_tx_t *tx =
 			    dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 
-			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT));
+			VERIFY0(dmu_tx_assign(tx, DMU_TX_WAIT |
+			    DMU_TX_SUSPEND));
 			uint64_t txg = dmu_tx_get_txg(tx);
 
 			/*
@@ -2114,7 +2115,6 @@ spa_vdev_remove_log(vdev_t *vd, uint64_t *txg)
 		ASSERT3P(vd->vdev_log_mg, ==, NULL);
 		return (error);
 	}
-	ASSERT0(vd->vdev_stat.vs_alloc);
 
 	/*
 	 * The evacuation succeeded.  Remove any remaining MOS metadata

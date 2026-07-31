@@ -1688,9 +1688,11 @@ zio_vdev_child_io(zio_t *pio, blkptr_t *bp, vdev_t *vd, uint64_t offset,
 
 	/*
 	 * If we've decided to do a repair, the write is not speculative --
-	 * even if the original read was.
+	 * even if the original read was. Rebuild is an exception since we
+	 * cannot always ensure its data integrity.
 	 */
-	if (flags & ZIO_FLAG_IO_REPAIR)
+	if ((flags & ZIO_FLAG_IO_REPAIR) &&
+	    pio->io_priority != ZIO_PRIORITY_REBUILD)
 		flags &= ~ZIO_FLAG_SPECULATIVE;
 
 	/*
@@ -2714,6 +2716,8 @@ zio_suspend(spa_t *spa, zio_t *zio, zio_suspend_reason_t reason)
 	}
 
 	mutex_exit(&spa->spa_suspend_lock);
+
+	txg_wait_kick(spa->spa_dsl_pool);
 }
 
 int
@@ -4013,14 +4017,21 @@ zio_ddt_free(zio_t *zio)
 	}
 	ddt_exit(ddt);
 
-	/*
-	 * When no entry was found, it must have been pruned,
-	 * so we can free it now instead of decrementing the
-	 * refcount in the DDT.
-	 */
-	if (!dde) {
+	if (dde) {
+		/*
+		 * DDT entry found and the refcount has been decremented.
+		 * Stop the pipeline — there is nothing more to do right now.
+		 */
+		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
+	} else {
+		/*
+		 * No DDT entry; the block must have been pruned from the
+		 * table.  Clear the DEDUP bit so it is treated as a normal
+		 * block from here on.  BRT_FREE and DVA_FREE follow in the
+		 * pipeline and will handle any cloned references and the
+		 * actual block free respectively.
+		 */
 		BP_SET_DEDUP(bp, 0);
-		zio->io_pipeline |= ZIO_STAGE_DVA_FREE;
 	}
 
 	return (zio);
@@ -5650,11 +5661,11 @@ static zio_pipe_stage_t *zio_pipeline[] = {
 	zio_encrypt,
 	zio_checksum_generate,
 	zio_nop_write,
-	zio_brt_free,
 	zio_ddt_read_start,
 	zio_ddt_read_done,
 	zio_ddt_write,
 	zio_ddt_free,
+	zio_brt_free,
 	zio_gang_assemble,
 	zio_gang_issue,
 	zio_dva_throttle,
