@@ -1415,8 +1415,8 @@ zio_rewrite(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp, abd_t *data,
 }
 
 void
-zio_write_override(zio_t *zio, blkptr_t *bp, int copies, boolean_t nopwrite,
-    boolean_t brtwrite)
+zio_write_override(zio_t *zio, blkptr_t *bp, int copies, int gang_copies,
+    boolean_t nopwrite, boolean_t brtwrite)
 {
 	ASSERT(zio->io_type == ZIO_TYPE_WRITE);
 	ASSERT(zio->io_child_type == ZIO_CHILD_LOGICAL);
@@ -1433,6 +1433,7 @@ zio_write_override(zio_t *zio, blkptr_t *bp, int copies, boolean_t nopwrite,
 	zio->io_prop.zp_nopwrite = nopwrite;
 	zio->io_prop.zp_brtwrite = brtwrite;
 	zio->io_prop.zp_copies = copies;
+	zio->io_prop.zp_gang_copies = gang_copies;
 	zio->io_bp_override = bp;
 }
 
@@ -2006,8 +2007,7 @@ zio_write_compress(zio_t *zio)
 			compress = ZIO_COMPRESS_OFF;
 			if (cabd != NULL)
 				abd_free(cabd);
-		} else if (!zp->zp_dedup && !zp->zp_encrypt &&
-		    psize <= BPE_PAYLOAD_SIZE &&
+		} else if (psize <= BPE_PAYLOAD_SIZE && !zp->zp_encrypt &&
 		    zp->zp_level == 0 && !DMU_OT_HAS_FILL(zp->zp_type) &&
 		    spa_feature_is_enabled(spa, SPA_FEATURE_EMBEDDED_DATA)) {
 			void *cbuf = abd_borrow_buf_copy(cabd, lsize);
@@ -2303,12 +2303,12 @@ zio_deadman_impl(zio_t *pio, int ziodepth)
 	zio_t *cio, *cio_next;
 	zio_link_t *zl = NULL;
 	vdev_t *vd = pio->io_vd;
+	uint64_t failmode = spa_get_deadman_failmode(pio->io_spa);
 
 	if (zio_deadman_log_all || (vd != NULL && vd->vdev_ops->vdev_op_leaf)) {
 		vdev_queue_t *vq = vd ? &vd->vdev_queue : NULL;
 		zbookmark_phys_t *zb = &pio->io_bookmark;
 		uint64_t delta = gethrtime() - pio->io_timestamp;
-		uint64_t failmode = spa_get_deadman_failmode(pio->io_spa);
 
 		zfs_dbgmsg("slow zio[%d]: zio=%px timestamp=%llu "
 		    "delta=%llu queued=%llu io=%llu "
@@ -2332,11 +2332,15 @@ zio_deadman_impl(zio_t *pio, int ziodepth)
 		    pio->io_error);
 		(void) zfs_ereport_post(FM_EREPORT_ZFS_DEADMAN,
 		    pio->io_spa, vd, zb, pio, 0);
+	}
 
-		if (failmode == ZIO_FAILURE_MODE_CONTINUE &&
-		    taskq_empty_ent(&pio->io_tqent)) {
-			zio_interrupt(pio);
-		}
+	if (vd != NULL && vd->vdev_ops->vdev_op_leaf &&
+	    list_is_empty(&pio->io_child_list) &&
+	    failmode == ZIO_FAILURE_MODE_CONTINUE &&
+	    taskq_empty_ent(&pio->io_tqent) &&
+	    pio->io_queue_state == ZIO_QS_ACTIVE) {
+		pio->io_error = EINTR;
+		zio_interrupt(pio);
 	}
 
 	mutex_enter(&pio->io_lock);
@@ -3141,15 +3145,13 @@ zio_write_gang_block(zio_t *pio, metaslab_class_t *mc)
 	boolean_t has_data = !(pio->io_flags & ZIO_FLAG_NODATA);
 
 	/*
-	 * If one copy was requested, store 2 copies of the GBH, so that we
-	 * can still traverse all the data (e.g. to free or scrub) even if a
-	 * block is damaged.  Note that we can't store 3 copies of the GBH in
-	 * all cases, e.g. with encryption, which uses DVA[2] for the IV+salt.
+	 * Store multiple copies of the GBH, so that we can still traverse
+	 * all the data (e.g. to free or scrub) even if a block is damaged.
+	 * This value respects the redundant_metadata property.
 	 */
-	int gbh_copies = copies;
-	if (gbh_copies == 1) {
-		gbh_copies = MIN(2, spa_max_replication(spa));
-	}
+	int gbh_copies = gio->io_prop.zp_gang_copies;
+	ASSERT3S(gbh_copies, >, 0);
+	ASSERT3S(gbh_copies, <=, SPA_DVAS_PER_BP);
 
 	ASSERT(ZIO_HAS_ALLOCATOR(pio));
 	int flags = METASLAB_HINTBP_FAVOR | METASLAB_GANG_HEADER;
@@ -3169,6 +3171,7 @@ zio_write_gang_block(zio_t *pio, metaslab_class_t *mc)
 		 * since metaslab_class_throttle_reserve() always allows
 		 * additional reservations for gang blocks.
 		 */
+		ASSERT3U(gbh_copies, >=, copies);
 		VERIFY(metaslab_class_throttle_reserve(mc, gbh_copies - copies,
 		    pio->io_allocator, pio, flags));
 	}
@@ -3231,6 +3234,7 @@ zio_write_gang_block(zio_t *pio, metaslab_class_t *mc)
 		zp.zp_type = zp.zp_storage_type = DMU_OT_NONE;
 		zp.zp_level = 0;
 		zp.zp_copies = gio->io_prop.zp_copies;
+		zp.zp_gang_copies = gio->io_prop.zp_gang_copies;
 		zp.zp_dedup = B_FALSE;
 		zp.zp_dedup_verify = B_FALSE;
 		zp.zp_nopwrite = B_FALSE;
@@ -3951,7 +3955,7 @@ zio_ddt_write(zio_t *zio)
 	 * grow the DDT entry by to satisfy the request.
 	 */
 	zio_prop_t czp = *zp;
-	czp.zp_copies = need_dvas;
+	czp.zp_copies = czp.zp_gang_copies = need_dvas;
 	zio_t *cio = zio_write(zio, spa, txg, bp, zio->io_orig_abd,
 	    zio->io_orig_size, zio->io_orig_size, &czp,
 	    zio_ddt_child_write_ready, NULL,

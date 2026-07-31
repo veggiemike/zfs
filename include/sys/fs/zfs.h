@@ -740,6 +740,8 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_METASLAB_SHIFT	"metaslab_shift"
 #define	ZPOOL_CONFIG_ASHIFT		"ashift"
 #define	ZPOOL_CONFIG_ASIZE		"asize"
+#define	ZPOOL_CONFIG_MIN_ALLOC		"min_alloc"
+#define	ZPOOL_CONFIG_MAX_ALLOC		"max_alloc"
 #define	ZPOOL_CONFIG_DTL		"DTL"
 #define	ZPOOL_CONFIG_SCAN_STATS		"scan_stats"	/* not stored on disk */
 #define	ZPOOL_CONFIG_REMOVAL_STATS	"removal_stats"	/* not stored on disk */
@@ -861,6 +863,10 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_CONFIG_MMP_SEQ		"mmp_seq"	/* not stored on disk */
 #define	ZPOOL_CONFIG_MMP_HOSTNAME	"mmp_hostname"	/* not stored on disk */
 #define	ZPOOL_CONFIG_MMP_HOSTID		"mmp_hostid"	/* not stored on disk */
+#define	ZPOOL_CONFIG_MMP_RESULT		"mmp_result"	/* not stored on disk */
+#define	ZPOOL_CONFIG_MMP_TRYIMPORT_NS	"mmp_tryimport_ns"	/* not stored */
+#define	ZPOOL_CONFIG_MMP_IMPORT_NS	"mmp_import_ns"	/* not stored on disk */
+#define	ZPOOL_CONFIG_MMP_CLAIM_NS	"mmp_claim_ns"	/* not stored on disk */
 #define	ZPOOL_CONFIG_ALLOCATION_BIAS	"alloc_bias"	/* not stored on disk */
 #define	ZPOOL_CONFIG_EXPANSION_TIME	"expansion_time"	/* not stored */
 #define	ZPOOL_CONFIG_REBUILD_STATS	"org.openzfs:rebuild_stats"
@@ -1613,6 +1619,15 @@ typedef enum zfs_ioc {
 	    ZFS_SPARSE)
 
 #endif
+
+typedef struct zfs_rewrite_args {
+	uint64_t	off;
+	uint64_t	len;
+	uint64_t	flags;
+	uint64_t	arg;
+} zfs_rewrite_args_t;
+
+#define	ZFS_IOC_REWRITE		_IOW(0x83, 3, zfs_rewrite_args_t)
 
 /*
  * ZFS-specific error codes used for returning descriptive errors

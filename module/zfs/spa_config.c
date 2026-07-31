@@ -461,6 +461,8 @@ spa_config_generate(spa_t *spa, vdev_t *vd, uint64_t txg, int getstats)
 	fnvlist_add_uint64(config, ZPOOL_CONFIG_POOL_TXG, txg);
 	fnvlist_add_uint64(config, ZPOOL_CONFIG_POOL_GUID, spa_guid(spa));
 	fnvlist_add_uint64(config, ZPOOL_CONFIG_ERRATA, spa->spa_errata);
+	fnvlist_add_uint64(config, ZPOOL_CONFIG_MIN_ALLOC, spa->spa_min_alloc);
+	fnvlist_add_uint64(config, ZPOOL_CONFIG_MAX_ALLOC, spa->spa_max_alloc);
 	if (spa->spa_comment != NULL)
 		fnvlist_add_string(config, ZPOOL_CONFIG_COMMENT,
 		    spa->spa_comment);
@@ -635,5 +637,7 @@ ZFS_MODULE_PARAM(zfs_spa, spa_, config_path, STRING, ZMOD_RD,
 	"SPA config file (/etc/zfs/zpool.cache)");
 #endif
 
+#ifdef _KERNEL
 ZFS_MODULE_PARAM(zfs, zfs_, autoimport_disable, INT, ZMOD_RW,
 	"Disable pool import at module load");
+#endif

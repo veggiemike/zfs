@@ -559,7 +559,7 @@ function default_cleanup_noexit
 		# Here, we loop through the pools we're allowed to
 		# destroy, only destroying them if it's safe to do
 		# so.
-		while [ ! -z ${ALL_POOLS} ]
+		while [ -n "${ALL_POOLS}" ]
 		do
 			for pool in ${ALL_POOLS}
 			do
@@ -2884,7 +2884,9 @@ function user_run
 	typeset out=$TEST_BASE_DIR/out
 	typeset err=$TEST_BASE_DIR/err
 
-	sudo -Eu $user env PATH="$PATH" ksh <<<"$*" >$out 2>$err
+	sudo -Eu $user \
+	    env PATH="$PATH" ZTS_LOG_SUPPRESS_TIMESTAMP=1 \
+	    ksh <<<"$*" >$out 2>$err
 	typeset res=$?
 	log_note "out: $(<$out)"
 	log_note "err: $(<$err)"
@@ -3801,8 +3803,6 @@ function directory_diff # dir_a dir_b
 	# do not match there is a "c" entry in one of the columns).
 	if rsync --version | grep -q "[, ] crtimes"; then
 		args+=("--crtimes")
-	else
-		log_note "This rsync package does not support --crtimes (-N)."
 	fi
 
 	# If we are testing a ZIL replay, we need to ignore timestamp changes.

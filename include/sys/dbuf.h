@@ -174,6 +174,7 @@ typedef struct dbuf_dirty_record {
 			arc_buf_t *dr_data;
 			override_states_t dr_override_state;
 			uint8_t dr_copies;
+			uint8_t dr_gang_copies;
 			boolean_t dr_nopwrite;
 			boolean_t dr_brtwrite;
 			boolean_t dr_diowrite;
@@ -446,6 +447,7 @@ int dbuf_dnode_findbp(dnode_t *dn, uint64_t level, uint64_t blkid,
 
 void dbuf_init(void);
 void dbuf_fini(void);
+void dbuf_cache_reduce_target_size(void);
 
 boolean_t dbuf_is_metadata(dmu_buf_impl_t *db);
 

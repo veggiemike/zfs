@@ -123,10 +123,10 @@ tags = ['functional', 'fallocate']
 [tests/functional/fault:Linux]
 tests = ['auto_offline_001_pos', 'auto_online_001_pos', 'auto_online_002_pos',
     'auto_replace_001_pos', 'auto_replace_002_pos', 'auto_spare_001_pos',
-    'auto_spare_002_pos', 'auto_spare_multiple', 'auto_spare_ashift',
-    'auto_spare_shared', 'decrypt_fault', 'decompress_fault',
-    'fault_limits', 'scrub_after_resilver', 'suspend_on_probe_errors',
-    'suspend_resume_single', 'zpool_status_-s']
+    'auto_spare_002_pos', 'auto_spare_double', 'auto_spare_multiple',
+    'auto_spare_ashift', 'auto_spare_shared', 'decrypt_fault',
+    'decompress_fault', 'fault_limits', 'scrub_after_resilver',
+    'suspend_on_probe_errors', 'suspend_resume_single', 'zpool_status_-s']
 tags = ['functional', 'fault']
 
 [tests/functional/features/large_dnode:Linux]
@@ -161,11 +161,13 @@ tags = ['functional', 'mmap']
 tests = ['mmp_on_thread', 'mmp_on_uberblocks', 'mmp_on_off', 'mmp_interval',
     'mmp_active_import', 'mmp_inactive_import', 'mmp_exported_import',
     'mmp_write_uberblocks', 'mmp_reset_interval', 'multihost_history',
-    'mmp_on_zdb', 'mmp_write_distribution', 'mmp_hostid', 'mmp_write_slow_disk']
+    'mmp_on_zdb', 'mmp_write_distribution', 'mmp_hostid', 'mmp_write_slow_disk',
+    'mmp_concurrent_import']
 tags = ['functional', 'mmp']
+timeout = 1200
 
 [tests/functional/mount:Linux]
-tests = ['umount_unlinked_drain']
+tests = ['umount_unlinked_drain', 'mount_loopback']
 tags = ['functional', 'mount']
 
 [tests/functional/pam:Linux]
@@ -209,6 +211,12 @@ tags = ['functional', 'simd']
 [tests/functional/snapshot:Linux]
 tests = ['snapshot_015_pos', 'snapshot_016_pos']
 tags = ['functional', 'snapshot']
+
+[tests/functional/syncfs:Linux]
+tests = ['syncfs_suspend']
+tags = ['functional', 'syncfs']
+pre =
+post =
 
 [tests/functional/tmpfile:Linux]
 tests = ['tmpfile_001_pos', 'tmpfile_002_pos', 'tmpfile_003_pos',

@@ -413,7 +413,7 @@ spa_load_failed(spa_t *spa, const char *fmt, ...)
 	(void) vsnprintf(buf, sizeof (buf), fmt, adx);
 	va_end(adx);
 
-	zfs_dbgmsg("spa_load(%s, config %s): FAILED: %s", spa->spa_name,
+	zfs_dbgmsg("spa_load(%s, config %s): FAILED: %s", spa_load_name(spa),
 	    spa->spa_trust_config ? "trusted" : "untrusted", buf);
 }
 
@@ -427,7 +427,7 @@ spa_load_note(spa_t *spa, const char *fmt, ...)
 	(void) vsnprintf(buf, sizeof (buf), fmt, adx);
 	va_end(adx);
 
-	zfs_dbgmsg("spa_load(%s, config %s): %s", spa->spa_name,
+	zfs_dbgmsg("spa_load(%s, config %s): %s", spa_load_name(spa),
 	    spa->spa_trust_config ? "trusted" : "untrusted", buf);
 
 	spa_import_progress_set_notes_nolog(spa, "%s", buf);
@@ -814,6 +814,7 @@ spa_add(const char *name, nvlist_t *config, const char *altroot)
 	spa->spa_min_ashift = INT_MAX;
 	spa->spa_max_ashift = 0;
 	spa->spa_min_alloc = INT_MAX;
+	spa->spa_max_alloc = 0;
 	spa->spa_gcd_alloc = INT_MAX;
 
 	/* Reset cached value */
@@ -855,6 +856,9 @@ spa_remove(spa_t *spa)
 
 	if (spa->spa_root)
 		spa_strfree(spa->spa_root);
+
+	if (spa->spa_load_name)
+		spa_strfree(spa->spa_load_name);
 
 	while ((dp = list_remove_head(&spa->spa_config_list)) != NULL) {
 		if (dp->scd_path != NULL)
@@ -1241,7 +1245,7 @@ spa_vdev_enter(spa_t *spa)
 	mutex_enter(&spa->spa_vdev_top_lock);
 	mutex_enter(&spa_namespace_lock);
 
-	ASSERT0(spa->spa_export_thread);
+	ASSERT0P(spa->spa_export_thread);
 
 	vdev_autotrim_stop_all(spa);
 
@@ -1260,7 +1264,7 @@ spa_vdev_detach_enter(spa_t *spa, uint64_t guid)
 	mutex_enter(&spa->spa_vdev_top_lock);
 	mutex_enter(&spa_namespace_lock);
 
-	ASSERT0(spa->spa_export_thread);
+	ASSERT0P(spa->spa_export_thread);
 
 	vdev_autotrim_stop_all(spa);
 
@@ -1589,6 +1593,34 @@ spa_generate_guid(spa_t *spa)
 	return (guid);
 }
 
+static boolean_t
+spa_load_guid_exists(uint64_t guid)
+{
+	avl_tree_t *t = &spa_namespace_avl;
+
+	ASSERT(MUTEX_HELD(&spa_namespace_lock));
+
+	for (spa_t *spa = avl_first(t); spa != NULL; spa = AVL_NEXT(t, spa)) {
+		if (spa_load_guid(spa) == guid)
+			return (B_TRUE);
+	}
+
+	return (arc_async_flush_guid_inuse(guid));
+}
+
+uint64_t
+spa_generate_load_guid(void)
+{
+	uint64_t guid;
+
+	do {
+		(void) random_get_pseudo_bytes((void *)&guid,
+		    sizeof (guid));
+	} while (guid == 0 || spa_load_guid_exists(guid));
+
+	return (guid);
+}
+
 void
 snprintf_blkptr(char *buf, size_t buflen, const blkptr_t *bp)
 {
@@ -1748,6 +1780,19 @@ spa_name(spa_t *spa)
 	return (spa->spa_name);
 }
 
+char *
+spa_load_name(spa_t *spa)
+{
+	/*
+	 * During spa_tryimport() the pool name includes a unique prefix.
+	 * Returns the original name which can be used for log messages.
+	 */
+	if (spa->spa_load_name)
+		return (spa->spa_load_name);
+
+	return (spa->spa_name);
+}
+
 uint64_t
 spa_guid(spa_t *spa)
 {
@@ -1846,6 +1891,19 @@ spa_get_worst_case_asize(spa_t *spa, uint64_t lsize)
 	if (lsize == 0)
 		return (0);	/* No inflation needed */
 	return (MAX(lsize, 1 << spa->spa_max_ashift) * spa_asize_inflation);
+}
+
+/*
+ * Return the range of minimum allocation sizes for the normal allocation
+ * class. This can be used by external consumers of the DMU to estimate
+ * potential wasted capacity when setting the recordsize for an object.
+ * This is mainly for dRAID pools which always pad to a full stripe width.
+ */
+void
+spa_get_min_alloc_range(spa_t *spa, uint64_t *min_alloc, uint64_t *max_alloc)
+{
+	*min_alloc = spa->spa_min_alloc;
+	*max_alloc = spa->spa_max_alloc;
 }
 
 /*
@@ -3047,6 +3105,7 @@ EXPORT_SYMBOL(spa_set_rootblkptr);
 EXPORT_SYMBOL(spa_altroot);
 EXPORT_SYMBOL(spa_sync_pass);
 EXPORT_SYMBOL(spa_name);
+EXPORT_SYMBOL(spa_load_name);
 EXPORT_SYMBOL(spa_guid);
 EXPORT_SYMBOL(spa_last_synced_txg);
 EXPORT_SYMBOL(spa_first_txg);
@@ -3055,6 +3114,7 @@ EXPORT_SYMBOL(spa_version);
 EXPORT_SYMBOL(spa_state);
 EXPORT_SYMBOL(spa_load_state);
 EXPORT_SYMBOL(spa_freeze_txg);
+EXPORT_SYMBOL(spa_get_min_alloc_range); /* for Lustre */
 EXPORT_SYMBOL(spa_get_dspace);
 EXPORT_SYMBOL(spa_update_dspace);
 EXPORT_SYMBOL(spa_deflate);

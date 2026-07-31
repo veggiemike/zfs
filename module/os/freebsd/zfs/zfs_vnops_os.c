@@ -25,6 +25,7 @@
  * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2017 Nexenta Systems, Inc.
+ * Copyright (c) 2025, Klara, Inc.
  */
 
 /* Portions Copyright 2007 Jeremy Teo */
@@ -98,14 +99,6 @@
 #endif
 
 VFS_SMR_DECLARE;
-
-#ifdef DEBUG_VFS_LOCKS
-#define	VNCHECKREF(vp)				  \
-	VNASSERT((vp)->v_holdcnt > 0 && (vp)->v_usecount > 0, vp,	\
-	    ("%s: wrong ref counts", __func__));
-#else
-#define	VNCHECKREF(vp)
-#endif
 
 #if __FreeBSD_version >= 1400045
 typedef uint64_t cookie_t;
@@ -304,6 +297,18 @@ zfs_ioctl(vnode_t *vp, ulong_t com, intptr_t data, int flag, cred_t *cred,
 			return (error);
 		*(offset_t *)data = off;
 		return (0);
+	}
+	case ZFS_IOC_REWRITE: {
+		zfs_rewrite_args_t *args = (zfs_rewrite_args_t *)data;
+		if ((flag & FWRITE) == 0)
+			return (SET_ERROR(EBADF));
+		error = vn_lock(vp, LK_SHARED);
+		if (error)
+			return (error);
+		error = zfs_rewrite(VTOZ(vp), args->off, args->len,
+		    args->flags, args->arg);
+		VOP_UNLOCK(vp);
+		return (error);
 	}
 	}
 	return (SET_ERROR(ENOTTY));
@@ -952,9 +957,6 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
 	zfs_acl_ids_t   acl_ids;
 	boolean_t	fuid_dirtied;
 	uint64_t	txtype;
-#ifdef DEBUG_VFS_LOCKS
-	vnode_t	*dvp = ZTOV(dzp);
-#endif
 
 	if (is_nametoolong(zfsvfs, name))
 		return (SET_ERROR(ENAMETOOLONG));
@@ -1084,7 +1086,8 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
 	getnewvnode_drop_reserve();
 
 out:
-	VNCHECKREF(dvp);
+	VNASSERT(ZTOV(dzp)->v_holdcnt > 0 && ZTOV(dzp)->v_usecount > 0,
+	    ZTOV(dzp), ("%s: wrong ref counts", __func__));
 	if (error == 0) {
 		*zpp = zp;
 	}
@@ -4072,6 +4075,33 @@ zfs_freebsd_getpages(struct vop_getpages_args *ap)
 	    ap->a_rahead));
 }
 
+typedef struct {
+	uint_t		pca_npages;
+	vm_page_t	pca_pages[];
+} putpage_commit_arg_t;
+
+static void
+zfs_putpage_commit_cb(void *arg)
+{
+	putpage_commit_arg_t *pca = arg;
+	vm_object_t object = pca->pca_pages[0]->object;
+
+	zfs_vmobject_wlock(object);
+
+	for (uint_t i = 0; i < pca->pca_npages; i++) {
+		vm_page_t pp = pca->pca_pages[i];
+		vm_page_undirty(pp);
+		vm_page_sunbusy(pp);
+	}
+
+	vm_object_pip_wakeupn(object, pca->pca_npages);
+
+	zfs_vmobject_wunlock(object);
+
+	kmem_free(pca,
+	    offsetof(putpage_commit_arg_t, pca_pages[pca->pca_npages]));
+}
+
 static int
 zfs_putpages(struct vnode *vp, vm_page_t *ma, size_t len, int flags,
     int *rtvals)
@@ -4173,10 +4203,12 @@ zfs_putpages(struct vnode *vp, vm_page_t *ma, size_t len, int flags,
 	}
 
 	if (zp->z_blksz < PAGE_SIZE) {
-		for (i = 0; len > 0; off += tocopy, len -= tocopy, i++) {
-			tocopy = len > PAGE_SIZE ? PAGE_SIZE : len;
+		vm_ooffset_t woff = off;
+		size_t wlen = len;
+		for (i = 0; wlen > 0; woff += tocopy, wlen -= tocopy, i++) {
+			tocopy = MIN(PAGE_SIZE, wlen);
 			va = zfs_map_page(ma[i], &sf);
-			dmu_write(zfsvfs->z_os, zp->z_id, off, tocopy, va, tx);
+			dmu_write(zfsvfs->z_os, zp->z_id, woff, tocopy, va, tx);
 			zfs_unmap_page(sf);
 		}
 	} else {
@@ -4197,19 +4229,48 @@ zfs_putpages(struct vnode *vp, vm_page_t *ma, size_t len, int flags,
 		zfs_tstamp_update_setup(zp, CONTENT_MODIFIED, mtime, ctime);
 		err = sa_bulk_update(zp->z_sa_hdl, bulk, count, tx);
 		ASSERT0(err);
-		/*
-		 * XXX we should be passing a callback to undirty
-		 * but that would make the locking messier
-		 */
-		zfs_log_write(zfsvfs->z_log, tx, TX_WRITE, zp, off,
-		    len, commit, B_FALSE, NULL, NULL);
 
-		zfs_vmobject_wlock(object);
-		for (i = 0; i < ncount; i++) {
-			rtvals[i] = zfs_vm_pagerret_ok;
-			vm_page_undirty(ma[i]);
+		if (commit) {
+			/*
+			 * Caller requested that we commit immediately. We set
+			 * a callback on the log entry, to be called once its
+			 * on disk after the call to zil_commit() below. The
+			 * pages will be undirtied and unbusied there.
+			 */
+			putpage_commit_arg_t *pca = kmem_alloc(
+			    offsetof(putpage_commit_arg_t, pca_pages[ncount]),
+			    KM_SLEEP);
+			pca->pca_npages = ncount;
+			memcpy(pca->pca_pages, ma, sizeof (vm_page_t) * ncount);
+
+			zfs_log_write(zfsvfs->z_log, tx, TX_WRITE, zp, off, len,
+			    B_TRUE, B_FALSE, zfs_putpage_commit_cb, pca);
+
+			for (i = 0; i < ncount; i++)
+				rtvals[i] = zfs_vm_pagerret_pend;
+		} else {
+			/*
+			 * Caller just wants the page written back somewhere,
+			 * but doesn't need it committed yet. We've already
+			 * written it back to the DMU, so we just need to put
+			 * it on the async log, then undirty the page and
+			 * return.
+			 *
+			 * We cannot use a callback here, because it would keep
+			 * the page busy (locked) until it is eventually
+			 * written down at txg sync.
+			 */
+			zfs_log_write(zfsvfs->z_log, tx, TX_WRITE, zp, off, len,
+			    B_FALSE, B_FALSE, NULL, NULL);
+
+			zfs_vmobject_wlock(object);
+			for (i = 0; i < ncount; i++) {
+				rtvals[i] = zfs_vm_pagerret_ok;
+				vm_page_undirty(ma[i]);
+			}
+			zfs_vmobject_wunlock(object);
 		}
-		zfs_vmobject_wunlock(object);
+
 		VM_CNT_INC(v_vnodeout);
 		VM_CNT_ADD(v_vnodepgsout, ncount);
 	}
@@ -5171,6 +5232,11 @@ zfs_freebsd_pathconf(struct vop_pathconf_args *ap)
 			return (0);
 		}
 		return (EINVAL);
+#ifdef _PC_HAS_HIDDENSYSTEM
+	case _PC_HAS_HIDDENSYSTEM:
+		*ap->a_retval = 1;
+		return (0);
+#endif
 	default:
 		return (vop_stdpathconf(ap));
 	}

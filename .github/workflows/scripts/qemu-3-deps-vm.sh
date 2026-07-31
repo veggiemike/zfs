@@ -4,9 +4,37 @@
 # 3) install dependencies for compiling and loading
 #
 # $1: OS name (like 'fedora41')
+# $2: (optional) Experimental Fedora kernel version, like "6.14" to
+#     install instead of Fedora defaults.
 ######################################################################
 
 set -eu
+
+function alpine() {
+  echo "##[group]Install Development Tools"
+  sudo apk add \
+    acl alpine-sdk attr autoconf automake bash build-base clang21 coreutils \
+    cpio cryptsetup curl curl-dev dhcpcd eudev eudev-dev eudev-libs findutils \
+    fio gawk gdb gettext-dev git grep jq libaio libaio-dev libcurl \
+    libtirpc-dev libtool libunwind libunwind-dev linux-headers linux-tools \
+    linux-virt linux-virt-dev lsscsi m4 make nfs-utils openssl-dev parted \
+    pax procps py3-cffi py3-distlib py3-packaging py3-setuptools python3 \
+    python3-dev qemu-guest-agent rng-tools rsync samba samba-server sed \
+    strace sysstat util-linux util-linux-dev wget words xfsprogs xxhash \
+    zlib-dev pamtester@testing
+  echo "##[endgroup]"
+
+  echo "##[group]Switch to eudev"
+  sudo setup-devd udev
+  echo "##[endgroup]"
+
+  echo "##[group]Install ksh93 from Source"
+  git clone --depth 1 https://github.com/ksh93/ksh.git /tmp/ksh
+  cd /tmp/ksh
+  ./bin/package make
+  sudo ./bin/package install /
+  echo "##[endgroup]"
+}
 
 function archlinux() {
   echo "##[group]Running pacman -Syu"
@@ -18,14 +46,19 @@ function archlinux() {
   sudo pacman -Sy --noconfirm base-devel bc cpio cryptsetup dhclient dkms \
     fakeroot fio gdb inetutils jq less linux linux-headers lsscsi nfs-utils \
     parted pax perf python-packaging python-setuptools qemu-guest-agent ksh \
-    samba sysstat rng-tools rsync wget xxhash
+    samba strace sysstat rng-tools rsync wget xxhash
   echo "##[endgroup]"
 }
 
 function debian() {
   export DEBIAN_FRONTEND="noninteractive"
 
+  echo "##[group]Wait for cloud-init to finish"
+  cloud-init status --wait
+  echo "##[endgroup]"
+
   echo "##[group]Running apt-get update+upgrade"
+  sudo sed -i '/[[:alpha:]]-backports/d' /etc/apt/sources.list
   sudo apt-get update -y
   sudo apt-get upgrade -y
   echo "##[endgroup]"
@@ -38,9 +71,10 @@ function debian() {
     libelf-dev libffi-dev libmount-dev libpam0g-dev libselinux-dev libssl-dev \
     libtool libtool-bin libudev-dev libunwind-dev linux-headers-$(uname -r) \
     lsscsi nfs-kernel-server pamtester parted python3 python3-all-dev \
-    python3-cffi python3-dev python3-distlib python3-packaging \
+    python3-cffi python3-dev python3-distlib python3-packaging libtirpc-dev \
     python3-setuptools python3-sphinx qemu-guest-agent rng-tools rpm2cpio \
-    rsync samba sysstat uuid-dev watchdog wget xfslibs-dev  xxhash zlib1g-dev
+    rsync samba strace sysstat uuid-dev watchdog wget xfslibs-dev xxhash \
+    zlib1g-dev
   echo "##[endgroup]"
 }
 
@@ -49,12 +83,13 @@ function freebsd() {
 
   echo "##[group]Install Development Tools"
   sudo pkg install -y autoconf automake autotools base64 checkbashisms fio \
-    gdb gettext gettext-runtime git gmake gsed jq ksh93 lcov libtool lscpu \
+    gdb gettext gettext-runtime git gmake gsed jq ksh lcov libtool lscpu \
     pkgconf python python3 pamtester pamtester qemu-guest-agent rsync xxhash
   sudo pkg install -xy \
     '^samba4[[:digit:]]+$' \
     '^py3[[:digit:]]+-cffi$' \
     '^py3[[:digit:]]+-sysctl$' \
+    '^py3[[:digit:]]+-setuptools$' \
     '^py3[[:digit:]]+-packaging$'
   echo "##[endgroup]"
 }
@@ -83,8 +118,13 @@ function rhel() {
     libuuid-devel lsscsi mdadm nfs-utils openssl-devel pam-devel pamtester \
     parted perf python3 python3-cffi python3-devel python3-packaging \
     kernel-devel python3-setuptools qemu-guest-agent rng-tools rpcgen \
-    rpm-build rsync samba sysstat systemd watchdog wget xfsprogs-devel xxhash \
-    zlib-devel
+    rpm-build rsync samba strace sysstat systemd watchdog wget xfsprogs-devel \
+    xxhash zlib-devel
+
+  # These are needed for building Lustre.  We only install these on EL VMs since
+  # we don't plan to test build Lustre on other platforms.
+  sudo dnf install -y libnl3-devel libyaml-devel libmount-devel
+
   echo "##[endgroup]"
 }
 
@@ -92,6 +132,25 @@ function tumbleweed() {
   echo "##[group]Running zypper is TODO!"
   sleep 23456
   echo "##[endgroup]"
+}
+
+# $1: Kernel version to install (like '6.14rc7')
+function install_fedora_experimental_kernel {
+
+  our_version="$1"
+  sudo dnf -y copr enable @kernel-vanilla/stable
+  sudo dnf -y copr enable @kernel-vanilla/mainline
+  all="$(sudo dnf list --showduplicates kernel-* python3-perf* perf* bpftool*)"
+  echo "Available versions:"
+  echo "$all"
+
+  # You can have a bunch of minor variants of the version we want '6.14'.
+  # Pick the newest variant (sorted by version number).
+  specific_version=$(echo "$all" | grep $our_version | awk '{print $2}' | sort -V | tail -n 1)
+  list="$(echo "$all" | grep $specific_version | grep -Ev 'kernel-rt|kernel-selftests|kernel-debuginfo' | sed 's/.x86_64//g' | awk '{print $1"-"$2}')"
+  sudo dnf install -y $list
+  sudo dnf -y copr disable @kernel-vanilla/stable
+  sudo dnf -y copr disable @kernel-vanilla/mainline
 }
 
 # Install dependencies
@@ -106,7 +165,7 @@ case "$1" in
     sudo dnf install -y kernel-abi-whitelists
     echo "##[endgroup]"
     ;;
-  almalinux9|centos-stream9|centos-stream10)
+  almalinux9|almalinux10|centos-stream9|centos-stream10)
     echo "##[group]Enable epel and crb repositories"
     sudo dnf config-manager -y --set-enabled crb
     sudo dnf install -y epel-release
@@ -115,6 +174,9 @@ case "$1" in
     echo "##[group]Install kernel-abi-stablelists"
     sudo dnf install -y kernel-abi-stablelists
     echo "##[endgroup]"
+    ;;
+  alpine*)
+    alpine
     ;;
   archlinux)
     archlinux
@@ -132,6 +194,11 @@ case "$1" in
 
     # Fedora 42+ moves /usr/bin/script from 'util-linux' to 'util-linux-script'
     sudo dnf install -y util-linux-script || true
+
+    # Optional: Install an experimental kernel ($2 = kernel version)
+    if [ -n "${2:-}" ] ; then
+      install_fedora_experimental_kernel "$2"
+    fi
     ;;
   freebsd*)
     freebsd
@@ -144,9 +211,7 @@ case "$1" in
     echo "##[group]Install Ubuntu specific"
     sudo apt-get install -yq linux-tools-common libtirpc-dev \
       linux-modules-extra-$(uname -r)
-    if [ "$1" != "ubuntu20" ]; then
-      sudo apt-get install -yq dh-sequence-dkms
-    fi
+    sudo apt-get install -yq dh-sequence-dkms
     echo "##[endgroup]"
     echo "##[group]Delete Ubuntu OpenZFS modules"
     for i in $(find /lib/modules -name zfs -type d); do sudo rm -rvf $i; done
@@ -161,6 +226,16 @@ test -z "${ONLY_DEPS:-}" || exit 0
 # Start services
 echo "##[group]Enable services"
 case "$1" in
+  alpine*)
+    sudo -E rc-update add qemu-guest-agent
+    sudo -E rc-update add nfs
+    sudo -E rc-update add samba
+    sudo -E rc-update add dhcpcd
+    # Remove services related to cloud-init.
+    sudo -E rc-update del cloud-init default
+    sudo -E rc-update del cloud-final default
+    sudo -E rc-update del cloud-config default
+    ;;
   freebsd*)
     # add virtio things
     echo 'virtio_load="YES"' | sudo -E tee -a /boot/loader.conf
@@ -216,7 +291,7 @@ case "$1" in
 esac
 
 case "$1" in
-  archlinux|freebsd*)
+  alpine*|archlinux|freebsd*)
     true
     ;;
   *)

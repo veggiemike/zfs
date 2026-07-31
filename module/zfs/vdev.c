@@ -243,6 +243,25 @@ vdev_dbgmsg_print_tree(vdev_t *vd, int indent)
 		vdev_dbgmsg_print_tree(vd->vdev_child[i], indent + 2);
 }
 
+char *
+vdev_rt_name(vdev_t *vd, const char *name)
+{
+	return (kmem_asprintf("{spa=%s vdev_guid=%llu %s}",
+	    spa_name(vd->vdev_spa),
+	    (u_longlong_t)vd->vdev_guid,
+	    name));
+}
+
+static char *
+vdev_rt_name_dtl(vdev_t *vd, const char *name, vdev_dtl_type_t dtl_type)
+{
+	return (kmem_asprintf("{spa=%s vdev_guid=%llu %s[%d]}",
+	    spa_name(vd->vdev_spa),
+	    (u_longlong_t)vd->vdev_guid,
+	    name,
+	    dtl_type));
+}
+
 /*
  * Virtual device management.
  */
@@ -540,6 +559,7 @@ vdev_add_child(vdev_t *pvd, vdev_t *cvd)
 
 	pvd->vdev_child = newchild;
 	pvd->vdev_child[id] = cvd;
+	pvd->vdev_nonrot &= cvd->vdev_nonrot;
 
 	cvd->vdev_top = (pvd->vdev_top ? pvd->vdev_top: cvd);
 	ASSERT(cvd->vdev_top->vdev_parent->vdev_parent == NULL);
@@ -648,7 +668,7 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 	if (spa->spa_root_vdev == NULL) {
 		ASSERT(ops == &vdev_root_ops);
 		spa->spa_root_vdev = vd;
-		spa->spa_load_guid = spa_generate_guid(NULL);
+		spa->spa_load_guid = spa_generate_load_guid();
 	}
 
 	if (guid == 0 && ops != &vdev_hole_ops) {
@@ -678,8 +698,9 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 
 	rw_init(&vd->vdev_indirect_rwlock, NULL, RW_DEFAULT, NULL);
 	mutex_init(&vd->vdev_obsolete_lock, NULL, MUTEX_DEFAULT, NULL);
-	vd->vdev_obsolete_segments = zfs_range_tree_create(NULL,
-	    ZFS_RANGE_SEG64, NULL, 0, 0);
+	vd->vdev_obsolete_segments = zfs_range_tree_create_flags(
+	    NULL, ZFS_RANGE_SEG64, NULL, 0, 0,
+	    ZFS_RT_F_DYN_NAME, vdev_rt_name(vd, "vdev_obsolete_segments"));
 
 	/*
 	 * Initialize rate limit structs for events.  We rate limit ZIO delay
@@ -733,8 +754,9 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 	cv_init(&vd->vdev_rebuild_cv, NULL, CV_DEFAULT, NULL);
 
 	for (int t = 0; t < DTL_TYPES; t++) {
-		vd->vdev_dtl[t] = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64,
-		    NULL, 0, 0);
+		vd->vdev_dtl[t] = zfs_range_tree_create_flags(
+		    NULL, ZFS_RANGE_SEG64, NULL, 0, 0,
+		    ZFS_RT_F_DYN_NAME, vdev_rt_name_dtl(vd, "vdev_dtl", t));
 	}
 
 	txg_list_create(&vd->vdev_ms_list, spa,
@@ -1361,6 +1383,7 @@ vdev_add_parent(vdev_t *cvd, vdev_ops_t *ops)
 	mvd->vdev_physical_ashift = cvd->vdev_physical_ashift;
 	mvd->vdev_state = cvd->vdev_state;
 	mvd->vdev_crtxg = cvd->vdev_crtxg;
+	mvd->vdev_nonrot = cvd->vdev_nonrot;
 
 	vdev_remove_child(pvd, cvd);
 	vdev_add_child(pvd, mvd);
@@ -1451,12 +1474,14 @@ vdev_spa_set_alloc(spa_t *spa, uint64_t min_alloc)
 {
 	if (min_alloc < spa->spa_min_alloc)
 		spa->spa_min_alloc = min_alloc;
-	if (spa->spa_gcd_alloc == INT_MAX) {
+
+	if (min_alloc > spa->spa_max_alloc)
+		spa->spa_max_alloc = min_alloc;
+
+	if (spa->spa_gcd_alloc == INT_MAX)
 		spa->spa_gcd_alloc = min_alloc;
-	} else {
-		spa->spa_gcd_alloc = vdev_gcd(min_alloc,
-		    spa->spa_gcd_alloc);
-	}
+	else
+		spa->spa_gcd_alloc = vdev_gcd(min_alloc, spa->spa_gcd_alloc);
 }
 
 void
@@ -1510,8 +1535,7 @@ vdev_metaslab_group_create(vdev_t *vd)
 			if (vd->vdev_ashift < spa->spa_min_ashift)
 				spa->spa_min_ashift = vd->vdev_ashift;
 
-			uint64_t min_alloc = vdev_get_min_alloc(vd);
-			vdev_spa_set_alloc(spa, min_alloc);
+			vdev_spa_set_alloc(spa, vdev_get_min_alloc(vd));
 		}
 	}
 }
@@ -1566,6 +1590,18 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 
 	vd->vdev_ms = mspp;
 	vd->vdev_ms_count = newc;
+
+	/*
+	 * Weighting algorithms can depend on the number of metaslabs in the
+	 * vdev. In order to ensure that all weights are correct at all times,
+	 * we need to recalculate here.
+	 */
+	for (uint64_t m = 0; m < oldc; m++) {
+		metaslab_t *msp = vd->vdev_ms[m];
+		mutex_enter(&msp->ms_lock);
+		metaslab_recalculate_weight_and_sort(msp);
+		mutex_exit(&msp->ms_lock);
+	}
 
 	for (uint64_t m = oldc; m < newc; m++) {
 		uint64_t object = 0;
@@ -1760,8 +1796,11 @@ vdev_probe_done(zio_t *zio)
 			 * change the state in a spa_async_request. Probes that
 			 * were initiated from a vdev_open can change the state
 			 * as part of the open call.
+			 * Skip fault injection if this vdev is already removed
+			 * or a removal is pending.
 			 */
-			if (vps->vps_zio_done_probe) {
+			if (vps->vps_zio_done_probe &&
+			    !vd->vdev_remove_wanted && !vd->vdev_removed) {
 				vd->vdev_fault_wanted = B_TRUE;
 				spa_async_request(spa, SPA_ASYNC_FAULT_VDEV);
 			}
@@ -1945,6 +1984,10 @@ vdev_open_children_impl(vdev_t *vd, vdev_open_children_func_t *open_func)
 		taskq_wait(tq);
 	for (int c = 0; c < children; c++) {
 		vdev_t *cvd = vd->vdev_child[c];
+
+		if (open_func(cvd) == B_FALSE ||
+		    cvd->vdev_state <= VDEV_STATE_FAULTED)
+			continue;
 		vd->vdev_nonrot &= cvd->vdev_nonrot;
 	}
 
@@ -3416,7 +3459,9 @@ vdev_dtl_load(vdev_t *vd)
 			return (error);
 		ASSERT(vd->vdev_dtl_sm != NULL);
 
-		rt = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+		rt = zfs_range_tree_create_flags(
+		    NULL, ZFS_RANGE_SEG64, NULL, 0, 0,
+		    ZFS_RT_F_DYN_NAME, vdev_rt_name(vd, "vdev_dtl_load:rt"));
 		error = space_map_load(vd->vdev_dtl_sm, rt, SM_ALLOC);
 		if (error == 0) {
 			mutex_enter(&vd->vdev_dtl_lock);
@@ -3564,7 +3609,8 @@ vdev_dtl_sync(vdev_t *vd, uint64_t txg)
 		ASSERT(vd->vdev_dtl_sm != NULL);
 	}
 
-	rtsync = zfs_range_tree_create(NULL, ZFS_RANGE_SEG64, NULL, 0, 0);
+	rtsync = zfs_range_tree_create_flags(NULL, ZFS_RANGE_SEG64, NULL, 0, 0,
+	    ZFS_RT_F_DYN_NAME, vdev_rt_name(vd, "rtsync"));
 
 	mutex_enter(&vd->vdev_dtl_lock);
 	zfs_range_tree_walk(rt, zfs_range_tree_add, rtsync);

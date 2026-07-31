@@ -265,6 +265,7 @@ zfs_sync(struct super_block *sb, int wait, cred_t *cr)
 {
 	(void) cr;
 	zfsvfs_t *zfsvfs = sb->s_fs_info;
+	ASSERT3P(zfsvfs, !=, NULL);
 
 	/*
 	 * Semantically, the only requirement is that the sync be initiated.
@@ -273,38 +274,22 @@ zfs_sync(struct super_block *sb, int wait, cred_t *cr)
 	if (!wait)
 		return (0);
 
-	if (zfsvfs != NULL) {
-		/*
-		 * Sync a specific filesystem.
-		 */
-		dsl_pool_t *dp;
-		int error;
+	int err = zfs_enter(zfsvfs, FTAG);
+	if (err != 0)
+		return (err);
 
-		if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
-			return (error);
-		dp = dmu_objset_pool(zfsvfs->z_os);
-
-		/*
-		 * If the system is shutting down, then skip any
-		 * filesystems which may exist on a suspended pool.
-		 */
-		if (spa_suspended(dp->dp_spa)) {
-			zfs_exit(zfsvfs, FTAG);
-			return (0);
-		}
-
-		if (zfsvfs->z_log != NULL)
-			zil_commit(zfsvfs->z_log, 0);
-
+	/*
+	 * If the pool is suspended, just return an error. This is to help
+	 * with shutting down with pools suspended, as we don't want to block
+	 * in that case.
+	 */
+	if (spa_suspended(zfsvfs->z_os->os_spa)) {
 		zfs_exit(zfsvfs, FTAG);
-	} else {
-		/*
-		 * Sync all ZFS filesystems.  This is what happens when you
-		 * run sync(1).  Unlike other filesystems, ZFS honors the
-		 * request by waiting for all pools to commit all dirty data.
-		 */
-		spa_sync_allpools();
+		return (SET_ERROR(EIO));
 	}
+
+	zil_commit(zfsvfs->z_log, 0);
+	zfs_exit(zfsvfs, FTAG);
 
 	return (0);
 }
@@ -1192,6 +1177,63 @@ zfs_root(zfsvfs_t *zfsvfs, struct inode **ipp)
 }
 
 /*
+ * Dentry and inode caches referenced by a task in non-root memcg are
+ * not going to be scanned by the kernel-provided shrinker. So, if
+ * kernel prunes nothing, fall back to this manual walk to free dnodes.
+ * To avoid scanning the same znodes multiple times they are always rotated
+ * to the end of the z_all_znodes list. New znodes are inserted at the
+ * end of the list so we're always scanning the oldest znodes first.
+ */
+static int
+zfs_prune_aliases(zfsvfs_t *zfsvfs, unsigned long nr_to_scan)
+{
+	znode_t **zp_array, *zp;
+	int max_array = MIN(nr_to_scan, PAGE_SIZE * 8 / sizeof (znode_t *));
+	int objects = 0;
+	int i = 0, j = 0;
+
+	zp_array = vmem_zalloc(max_array * sizeof (znode_t *), KM_SLEEP);
+
+	mutex_enter(&zfsvfs->z_znodes_lock);
+	while ((zp = list_head(&zfsvfs->z_all_znodes)) != NULL) {
+
+		if ((i++ > nr_to_scan) || (j >= max_array))
+			break;
+
+		ASSERT(list_link_active(&zp->z_link_node));
+		list_remove(&zfsvfs->z_all_znodes, zp);
+		list_insert_tail(&zfsvfs->z_all_znodes, zp);
+
+		/* Skip active znodes and .zfs entries */
+		if (MUTEX_HELD(&zp->z_lock) || zp->z_is_ctldir)
+			continue;
+
+		if (igrab(ZTOI(zp)) == NULL)
+			continue;
+
+		zp_array[j] = zp;
+		j++;
+	}
+	mutex_exit(&zfsvfs->z_znodes_lock);
+
+	for (i = 0; i < j; i++) {
+		zp = zp_array[i];
+
+		ASSERT3P(zp, !=, NULL);
+		d_prune_aliases(ZTOI(zp));
+
+		if (atomic_read(&ZTOI(zp)->i_count) == 1)
+			objects++;
+
+		zrele(zp);
+	}
+
+	vmem_free(zp_array, max_array * sizeof (znode_t *));
+
+	return (objects);
+}
+
+/*
  * The ARC has requested that the filesystem drop entries from the dentry
  * and inode caches.  This can occur when the ARC needs to free meta data
  * blocks but can't because they are all pinned by entries in these caches.
@@ -1241,6 +1283,14 @@ zfs_prune(struct super_block *sb, unsigned long nr_to_scan, int *objects)
 #else
 	*objects = (*shrinker->scan_objects)(shrinker, &sc);
 #endif
+
+	/*
+	 * Fall back to zfs_prune_aliases if kernel's shrinker did nothing
+	 * due to dentry and inode caches being referenced by a task running
+	 * in non-root memcg.
+	 */
+	if (*objects == 0)
+		*objects = zfs_prune_aliases(zfsvfs, nr_to_scan);
 
 	zfs_exit(zfsvfs, FTAG);
 
@@ -1470,6 +1520,12 @@ zfs_domount(struct super_block *sb, zfs_mnt_t *zm, int silent)
 	sb->s_op = &zpl_super_operations;
 	sb->s_xattr = zpl_xattr_handlers;
 	sb->s_export_op = &zpl_export_operations;
+
+#ifdef HAVE_SET_DEFAULT_D_OP
+	set_default_d_op(sb, &zpl_dentry_operations);
+#else
+	sb->s_d_op = &zpl_dentry_operations;
+#endif
 
 	/* Set features for file system. */
 	zfs_set_fuid_feature(zfsvfs);

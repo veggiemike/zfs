@@ -67,8 +67,12 @@
 #include "zfs_comutil.h"
 
 /* Used by fstat(1). */
+#ifdef SYSCTL_SIZEOF
+SYSCTL_SIZEOF(znode, znode_t);
+#else
 SYSCTL_INT(_debug_sizeof, OID_AUTO, znode, CTLFLAG_RD,
 	SYSCTL_NULL_INT_PTR, sizeof (znode_t), "sizeof(znode_t)");
+#endif
 
 /*
  * Define ZNODE_STATS to turn on statistic gathering. By default, it is only
@@ -146,8 +150,6 @@ zfs_znode_cache_constructor(void *buf, void *arg, int kmflags)
 	zp->z_xattr_cached = NULL;
 	zp->z_xattr_parent = 0;
 	zp->z_vnode = NULL;
-	zp->z_sync_writes_cnt = 0;
-	zp->z_async_writes_cnt = 0;
 
 	return (0);
 }
@@ -168,9 +170,6 @@ zfs_znode_cache_destructor(void *buf, void *arg)
 
 	ASSERT3P(zp->z_acl_cached, ==, NULL);
 	ASSERT3P(zp->z_xattr_cached, ==, NULL);
-
-	ASSERT0(atomic_load_32(&zp->z_sync_writes_cnt));
-	ASSERT0(atomic_load_32(&zp->z_async_writes_cnt));
 }
 
 
@@ -289,6 +288,7 @@ zfs_create_share_dir(zfsvfs_t *zfsvfs, dmu_tx_t *tx)
 	sharezp->z_atime_dirty = 0;
 	sharezp->z_zfsvfs = zfsvfs;
 	sharezp->z_is_sa = zfsvfs->z_use_sa;
+	sharezp->z_pflags = 0;
 
 	VERIFY0(zfs_acl_ids_create(sharezp, IS_ROOT_NODE, &vattr,
 	    kcred, NULL, &acl_ids, NULL));
@@ -451,8 +451,6 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	zp->z_blksz = blksz;
 	zp->z_seq = 0x7A4653;
 	zp->z_sync_cnt = 0;
-	zp->z_sync_writes_cnt = 0;
-	zp->z_async_writes_cnt = 0;
 	atomic_store_ptr(&zp->z_cached_symlink, NULL);
 
 	zfs_znode_sa_init(zfsvfs, zp, db, obj_type, hdl);
@@ -796,6 +794,10 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	(*zpp)->z_mode = mode;
 	(*zpp)->z_dnodesize = dnodesize;
 
+	vnode_t *vp = ZTOV(*zpp);
+	if (!(flag & IS_ROOT_NODE))
+		vn_seqc_write_begin(vp);
+
 	if (vap->va_mask & AT_XVATTR)
 		zfs_xvattr_set(*zpp, (xvattr_t *)vap, tx);
 
@@ -804,7 +806,7 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 		VERIFY0(zfs_aclset_common(*zpp, acl_ids->z_aclp, cr, tx));
 	}
 	if (!(flag & IS_ROOT_NODE)) {
-		vnode_t *vp = ZTOV(*zpp);
+		vn_seqc_write_end(vp);
 		vp->v_vflag |= VV_FORCEINSMQ;
 		int err = insmntque(vp, zfsvfs->z_vfs);
 		vp->v_vflag &= ~VV_FORCEINSMQ;
@@ -1725,6 +1727,7 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	rootzp->z_unlinked = 0;
 	rootzp->z_atime_dirty = 0;
 	rootzp->z_is_sa = USE_SA(version, os);
+	rootzp->z_pflags = 0;
 
 	zfsvfs->z_os = os;
 	zfsvfs->z_parent = zfsvfs;
